@@ -30,6 +30,12 @@ Run the development server:
 npm run dev
 ```
 
+The backend runs on:
+
+```text
+http://localhost:4000
+```
+
 Run the socket server when needed:
 
 ```bash
