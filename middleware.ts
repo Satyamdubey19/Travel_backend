@@ -95,6 +95,41 @@ async function getAuthSession(req: NextRequest): Promise<AuthSession | null> {
   return customSession;
 }
 
+async function getVerifiedAuthSession(req: NextRequest): Promise<AuthSession | null> {
+  try {
+    const response = await fetch(new URL("/api/auth/me", req.nextUrl.origin), {
+      headers: {
+        cookie: req.headers.get("cookie") ?? "",
+      },
+      cache: "no-store",
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const payload = (await response.json()) as {
+      user?: {
+        id?: string;
+        role?: SessionRole;
+        isHost?: boolean;
+      };
+    };
+
+    if (!payload.user?.id) {
+      return null;
+    }
+
+    return {
+      id: String(payload.user.id),
+      role: payload.user.role,
+      isHost: payload.user.isHost === true,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function redirectToLogin(req: NextRequest, role?: SessionRole) {
   const url = req.nextUrl.clone();
   url.pathname = "/login";
@@ -113,7 +148,8 @@ export async function middleware(req: NextRequest) {
     return NextResponse.next();
   }
 
-  const session = await getAuthSession(req);
+  const tokenSession = await getAuthSession(req);
+  const session = tokenSession ? await getVerifiedAuthSession(req) : null;
 
   if (!session) {
     if (path.startsWith("/admin")) return redirectToLogin(req, "ADMIN");

@@ -78,6 +78,10 @@ export const authOptions: NextAuthOptions = {
         return false;
       }
 
+      if (!profile || !("email_verified" in profile) || (profile as { email_verified?: boolean }).email_verified !== true) {
+        return false;
+      }
+
       const dbUser = await handleGoogleAuth({
         email,
         name: user.name ?? profile?.name,
