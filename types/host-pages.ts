@@ -1,0 +1,9 @@
+export type PropertyType = any
+export type HostedProperty = any
+export type HostDashboardStats = any
+export type HostTaskProps = any
+export type MiniMetricProps = any
+export type PropertyCardProps = any
+export type QuickActionProps = any
+export type HostBooking = any
+export type HostBookingActionProps = any
