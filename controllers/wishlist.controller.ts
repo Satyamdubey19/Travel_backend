@@ -39,10 +39,8 @@ export const getWishlistController = async () => {
 export const addToWishlistController = async (req: NextRequest) => {
   try {
     const body = await req.json();
-    const { target, hotelId, hotelSlug, tourId, tourSlug, rentalId, activityId } = body as {
+    const { target, tourId, tourSlug, rentalId, activityId } = body as {
       target?: string;
-      hotelId?: string;
-      hotelSlug?: string;
       tourId?: string;
       tourSlug?: string;
       rentalId?: string;
@@ -55,18 +53,16 @@ export const addToWishlistController = async (req: NextRequest) => {
       return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 });
     }
 
-    const validTargets: string[] = ["HOTEL", "TOUR", "RENTAL", "ACTIVITY"];
+    const validTargets: string[] = ["TOUR", "RENTAL", "ACTIVITY"];
     if (!target || !validTargets.includes(target)) {
       return new Response(
-        JSON.stringify({ error: "target is required: HOTEL | TOUR | RENTAL | ACTIVITY" }),
+        JSON.stringify({ error: "target is required: TOUR | RENTAL | ACTIVITY" }),
         { status: 400 }
       );
     }
 
     const newItem = await addToWishlistService(userId, {
       target: target as WishlistTarget,
-      hotelId,
-      hotelSlug,
       tourId,
       tourSlug,
       rentalId,

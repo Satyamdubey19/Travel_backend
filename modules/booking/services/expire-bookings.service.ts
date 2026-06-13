@@ -1,6 +1,5 @@
 import { Prisma } from "@prisma/client"
 import { prisma } from "@/lib/prisma"
-import { releaseReservedRoomInventory } from "@/services/availability.service"
 
 type ExpireStaleBookingsOptions = {
   now?: Date
@@ -28,15 +27,6 @@ export async function expireStaleBookings(options: ExpireStaleBookingsOptions = 
     select: {
       id: true,
       couponId: true,
-      BookingRoom: {
-        select: {
-          roomId: true,
-          checkIn: true,
-          checkOut: true,
-          quantity: true,
-          inventoryReserved: true,
-        },
-      },
     },
     orderBy: { expiresAt: "asc" },
     take: limit,
@@ -69,27 +59,6 @@ export async function expireStaleBookings(options: ExpireStaleBookingsOptions = 
 
         if (claim.count !== 1) return false
 
-        for (const bookingRoom of booking.BookingRoom) {
-          if (!bookingRoom.inventoryReserved) continue
-
-          await releaseReservedRoomInventory({
-            roomId: bookingRoom.roomId,
-            checkIn: bookingRoom.checkIn,
-            checkOut: bookingRoom.checkOut,
-            quantity: bookingRoom.quantity,
-          }, tx)
-        }
-
-        await tx.inventoryReservation.updateMany({
-          where: { bookingId: booking.id, status: "ACTIVE" },
-          data: { status: "EXPIRED" },
-        })
-
-        await tx.bookingRoom.updateMany({
-          where: { bookingId: booking.id },
-          data: { inventoryReserved: false },
-        })
-
         await tx.payment.updateMany({
           where: { bookingId: booking.id, status: "PENDING" },
           data: { status: "FAILED", refundReason: EXPIRY_REASON },
@@ -115,14 +84,6 @@ export async function expireStaleBookings(options: ExpireStaleBookingsOptions = 
             metadata: {
               reason: EXPIRY_REASON,
               expiredAt: now.toISOString(),
-              releasedInventory: booking.BookingRoom
-                .filter((room) => room.inventoryReserved)
-                .map((room) => ({
-                  roomId: room.roomId,
-                  checkIn: room.checkIn.toISOString(),
-                  checkOut: room.checkOut.toISOString(),
-                  quantity: room.quantity,
-                })),
             },
           },
         })

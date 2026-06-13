@@ -79,25 +79,8 @@ export async function listHostBookings(input: ListHostBookingsInput) {
         totalAmount: true,
         currency: true,
         createdAt: true,
-        Hotel: {
-          select: { id: true, title: true, slug: true, city: true },
-        },
         Tour: {
           select: { id: true, title: true, slug: true, city: true },
-        },
-        BookingRoom: {
-          select: {
-            id: true,
-            roomId: true,
-            roomName: true,
-            quantity: true,
-            Room: {
-              select: {
-                availableRooms: true,
-                totalRooms: true,
-              },
-            },
-          },
         },
         Payment: {
           select: {
@@ -146,14 +129,6 @@ export async function listHostBookings(input: ListHostBookingsInput) {
         name: booking.contactName || booking.User.name || "Guest",
         email: booking.contactEmail || booking.User.email,
       },
-      hotel: booking.Hotel
-        ? {
-            id: booking.Hotel.id,
-            name: booking.Hotel.title,
-            slug: booking.Hotel.slug,
-            city: booking.Hotel.city,
-          }
-        : null,
       tour: booking.Tour
         ? {
             id: booking.Tour.id,
@@ -162,14 +137,7 @@ export async function listHostBookings(input: ListHostBookingsInput) {
             city: booking.Tour.city,
           }
         : null,
-      rooms: booking.BookingRoom.map((room) => ({
-        id: room.id,
-        roomId: room.roomId,
-        name: room.roomName,
-        quantity: room.quantity,
-        availableRooms: room.Room.availableRooms,
-        bookedRooms: Math.max(room.Room.totalRooms - room.Room.availableRooms, 0),
-      })),
+      rooms: [],
       payment: booking.Payment
         ? {
             status: booking.Payment.status,
@@ -209,15 +177,6 @@ export async function updateHostBookingStatus(input: UpdateHostBookingInput) {
       select: {
         id: true,
         status: true,
-        BookingRoom: {
-          select: {
-            roomId: true,
-            checkIn: true,
-            checkOut: true,
-            quantity: true,
-            inventoryReserved: true,
-          },
-        },
       },
     })
 
@@ -231,32 +190,6 @@ export async function updateHostBookingStatus(input: UpdateHostBookingInput) {
     }
 
     if (newStatus === "CANCELLED") {
-      const { releaseReservedRoomInventory } = await import("@/services/availability.service")
-
-      for (const room of booking.BookingRoom) {
-        if (room.inventoryReserved) {
-          await releaseReservedRoomInventory(
-            {
-              roomId: room.roomId,
-              checkIn: room.checkIn,
-              checkOut: room.checkOut,
-              quantity: room.quantity,
-            },
-            tx,
-          )
-        }
-      }
-
-      await tx.bookingRoom.updateMany({
-        where: { bookingId },
-        data: { inventoryReserved: false },
-      })
-
-      await tx.inventoryReservation.updateMany({
-        where: { bookingId, status: "ACTIVE" },
-        data: { status: "CANCELLED" },
-      })
-
       await tx.payment.updateMany({
         where: { bookingId, status: { not: "REFUNDED" } },
         data: { status: "FAILED" },

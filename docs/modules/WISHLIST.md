@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The wishlist module lets authenticated users save and remove hotels, tours, rentals, and activities.
+The wishlist module lets authenticated users save and remove tours, rentals, and activities.
 
 ## Source Files
 
@@ -29,7 +29,6 @@ DELETE /api/wishlist
 ## Supported Targets
 
 ```text
-HOTEL
 TOUR
 RENTAL
 ACTIVITY

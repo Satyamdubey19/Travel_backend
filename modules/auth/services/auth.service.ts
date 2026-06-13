@@ -4,12 +4,14 @@ import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { generateToken, hashToken } from "@/lib/hash";
 import { sendAuthEmail, sendVerificationEmail } from "@/lib/mail";
-import type { Gender } from "@prisma/client";
+import type { Gender, Prisma } from "@prisma/client";
 import type { AuthRole, LoginInput, RegisterInput } from "@/modules/auth/types/auth";
 import { invalidateUserSessions, isTokenRevoked, isUserSessionInvalidated } from "@/modules/auth/services/auth-security.service";
 
 const passwordRounds = 12;
 const sessionTtl = "7d";
+const refreshTokenTtlMs = 1000 * 60 * 60 * 24 * 30;
+const passwordResetTtlMs = 1000 * 60 * 60;
 const dummyPasswordHash = "$2b$12$J5mwthkzJDbOt3ElCdU5/uCF9tUoz0B0brOcFVAw4DvIN7uo/LCO6";
 
 interface GoogleAuthInput {
@@ -29,6 +31,16 @@ type DbUser = {
   isActive?: boolean;
   isBanned?: boolean;
   deletedAt?: Date | null;
+  lockedUntil?: Date | null;
+  failedLoginAttempts?: number;
+  emailVerifiedAt?: Date | null;
+};
+
+export type AuthRequestContext = {
+  ipAddress?: string;
+  userAgent?: string;
+  deviceId?: string;
+  deviceName?: string;
 };
 
 const phoneSchema = z
@@ -131,6 +143,22 @@ function assertActiveAccount(user: DbUser) {
   }
 }
 
+function assertAccountCanVerify(user: DbUser) {
+  if (user.deletedAt || user.isBanned || user.isActive === false || user.status === "DELETED" || user.status === "BANNED") {
+    const error = new Error("Account is not allowed to authenticate") as Error & { statusCode?: number };
+    error.statusCode = 403;
+    throw error;
+  }
+}
+
+function assertNotLocked(user: DbUser) {
+  if (user.lockedUntil && user.lockedUntil.getTime() > Date.now()) {
+    const error = new Error("Account is temporarily locked. Try again later.") as Error & { statusCode?: number };
+    error.statusCode = 423;
+    throw error;
+  }
+}
+
 function isAccountUsable(user: DbUser) {
   return !user.deletedAt && !user.isBanned && user.isActive !== false && (!user.status || user.status === "ACTIVE");
 }
@@ -158,6 +186,149 @@ function normalizeGender(value?: string | null): Gender | null {
     return upper as Gender
   }
   return null
+}
+
+function sanitizedContext(context?: AuthRequestContext) {
+  return {
+    ipAddress: context?.ipAddress || "unknown",
+    userAgent: context?.userAgent?.slice(0, 500),
+    deviceId: context?.deviceId?.slice(0, 120),
+    deviceName: context?.deviceName?.slice(0, 160),
+  };
+}
+
+async function recordSecurityEvent(userId: string, type: string, context?: AuthRequestContext, metadata?: Record<string, unknown>) {
+  const ctx = sanitizedContext(context);
+  const jsonMetadata = metadata ? JSON.parse(JSON.stringify(metadata)) as Prisma.InputJsonValue : undefined;
+  await prisma.securityEvent.create({
+    data: {
+      userId,
+      type,
+      ipAddress: ctx.ipAddress,
+      userAgent: ctx.userAgent,
+      metadata: jsonMetadata,
+    },
+  }).catch((error) => {
+    console.error("Failed to record security event:", error);
+  });
+}
+
+async function recordLoginAttempt(email: string, success: boolean, context?: AuthRequestContext) {
+  const ctx = sanitizedContext(context);
+  await prisma.loginAttempt.create({
+    data: {
+      email,
+      ipAddress: ctx.ipAddress,
+      success,
+    },
+  }).catch((error) => {
+    console.error("Failed to record login attempt:", error);
+  });
+}
+
+function nextLockUntil(attempts: number) {
+  if (attempts >= 20) {
+    return new Date(Date.now() + 1000 * 60 * 60 * 24);
+  }
+  if (attempts >= 10) {
+    return new Date(Date.now() + 1000 * 60 * 60);
+  }
+  if (attempts >= 5) {
+    return new Date(Date.now() + 1000 * 60 * 15);
+  }
+  return null;
+}
+
+async function registerFailedLogin(user: DbUser, email: string, context?: AuthRequestContext) {
+  const attempts = (user.failedLoginAttempts ?? 0) + 1;
+  const lockedUntil = nextLockUntil(attempts);
+
+  await prisma.user.update({
+    where: { id: user.id },
+    data: {
+      failedLoginAttempts: attempts,
+      lockedUntil,
+      ...(attempts >= 20 ? { status: "SUSPENDED" } : {}),
+    },
+  });
+
+  await recordLoginAttempt(email, false, context);
+  await recordSecurityEvent(user.id, lockedUntil ? "ACCOUNT_LOCKED" : "LOGIN_FAILED", context, { failedLoginAttempts: attempts });
+}
+
+async function createRefreshAuth(user: Pick<DbUser, "id">, context?: AuthRequestContext) {
+  const ctx = sanitizedContext(context);
+  const rawRefreshToken = generateToken();
+  const expiresAt = new Date(Date.now() + refreshTokenTtlMs);
+
+  await prisma.session.create({
+    data: {
+      userId: user.id,
+      deviceName: ctx.deviceName,
+      deviceType: ctx.deviceId ? "known" : "browser",
+      ipAddress: ctx.ipAddress,
+      userAgent: ctx.userAgent,
+    },
+  });
+
+  await prisma.refreshToken.create({
+    data: {
+      userId: user.id,
+      tokenHash: hashToken(rawRefreshToken),
+      deviceId: ctx.deviceId,
+      deviceName: ctx.deviceName,
+      ipAddress: ctx.ipAddress,
+      userAgent: ctx.userAgent,
+      expiresAt,
+    },
+  });
+
+  if (ctx.deviceId) {
+    await prisma.userDevice.upsert({
+      where: {
+        userId_deviceId: {
+          userId: user.id,
+          deviceId: ctx.deviceId,
+        },
+      },
+      create: {
+        userId: user.id,
+        deviceId: ctx.deviceId,
+        deviceType: "browser",
+        ipAddress: ctx.ipAddress,
+      },
+      update: {
+        ipAddress: ctx.ipAddress,
+      },
+    }).catch((error) => {
+      console.error("Failed to upsert user device:", error);
+    });
+  }
+
+  return rawRefreshToken;
+}
+
+async function resetLoginState(userId: string, context?: AuthRequestContext) {
+  const ctx = sanitizedContext(context);
+  await prisma.user.update({
+    where: { id: userId },
+    data: {
+      failedLoginAttempts: 0,
+      lockedUntil: null,
+      lastLoginAt: new Date(),
+    },
+  });
+  await prisma.session.updateMany({
+    where: {
+      userId,
+      isActive: true,
+      ipAddress: ctx.ipAddress,
+      userAgent: ctx.userAgent,
+    },
+    data: {
+      lastSeenAt: new Date(),
+    },
+  });
 }
 
 function getJwtSecret() {
@@ -217,7 +388,7 @@ export async function toAuthUser(user: DbUser) {
   };
 }
 
-export async function registerUser(input: RegisterInput) {
+export async function registerUser(input: RegisterInput, context?: AuthRequestContext) {
   const parsed = parseOrThrow(registerSchema, input);
   const email = normalizeEmail(parsed.email);
   const requestedRole = normalizeRole(parsed.role);
@@ -257,6 +428,7 @@ export async function registerUser(input: RegisterInput) {
         phone: parsed.phone,
         password: hashedPassword,
         role,
+        status: "PENDING",
         provider: "credentials",
         isEmailVerified: false,
         verificationToken,
@@ -283,22 +455,26 @@ export async function registerUser(input: RegisterInput) {
     console.error("Failed to send signup email:", error);
   });
 
+  await recordSecurityEvent(user.id, "REGISTERED", context);
+
   return {
     user: await toAuthUser(user),
   };
 }
 
-export async function LoginUser(input: LoginInput & { type?: string }) {
+export async function LoginUser(input: LoginInput & { type?: string }, context?: AuthRequestContext) {
   const parsed = parseOrThrow(loginSchema, input);
   const email = normalizeEmail(parsed.email);
   const user = await prisma.user.findUnique({ where: { email } });
 
   if (!user?.password) {
     await bcrypt.compare(parsed.password, dummyPasswordHash);
+    await recordLoginAttempt(email, false, context);
     throw new Error("Incorrect email or password");
   }
 
-  assertActiveAccount(user);
+  assertAccountCanVerify(user);
+  assertNotLocked(user);
 
   if (!user.isEmailVerified) {
     const error = new Error("Please verify your email before logging in") as Error & { statusCode?: number };
@@ -306,8 +482,11 @@ export async function LoginUser(input: LoginInput & { type?: string }) {
     throw error;
   }
 
+  assertActiveAccount(user);
+
   const isValidPassword = await bcrypt.compare(parsed.password, user.password);
   if (!isValidPassword) {
+    await registerFailedLogin(user, email, context);
     throw new Error("Incorrect email or password");
   }
 
@@ -320,8 +499,15 @@ export async function LoginUser(input: LoginInput & { type?: string }) {
     (requestedRole === "ADMIN" && authUser.role === "ADMIN");
 
   if (!hasRequestedRole) {
+    await recordLoginAttempt(email, false, context);
+    await recordSecurityEvent(user.id, "LOGIN_ROLE_DENIED", context, { requestedRole });
     throw new Error(`This account does not have ${requestedRole?.toLowerCase()} access`);
   }
+
+  await resetLoginState(user.id, context);
+  await recordLoginAttempt(email, true, context);
+  await recordSecurityEvent(user.id, "LOGIN_SUCCESS", context);
+  const refreshToken = await createRefreshAuth(user, context);
 
   await sendAuthEmail({ to: user.email, name: user.name, type: "login" }).catch((error) => {
     console.error("Failed to send login email:", error);
@@ -330,6 +516,7 @@ export async function LoginUser(input: LoginInput & { type?: string }) {
   return {
     user: authUser,
     token: createSessionToken(user),
+    refreshToken,
   };
 }
 
@@ -354,6 +541,8 @@ export async function handleGoogleAuth(input: GoogleAuthInput) {
         provider: "google",
         providerId,
         isEmailVerified: true,
+        emailVerifiedAt: new Date(),
+        status: "ACTIVE",
       },
     });
   } else {
@@ -365,6 +554,8 @@ export async function handleGoogleAuth(input: GoogleAuthInput) {
         provider: user.provider === "credentials" ? user.provider : "google",
         providerId: user.providerId ?? providerId,
         isEmailVerified: true,
+        emailVerifiedAt: user.emailVerifiedAt ?? new Date(),
+        status: "ACTIVE",
       },
     });
   }
@@ -398,7 +589,7 @@ export async function VerifyEmail(emailInput: string, token: string) {
     throw new Error("Invalid verification link");
   }
 
-  assertActiveAccount(user);
+  assertAccountCanVerify(user);
 
   if (user.verificationExpiry && user.verificationExpiry.getTime() < Date.now()) {
     throw new Error("Verification link has expired");
@@ -414,6 +605,8 @@ export async function VerifyEmail(emailInput: string, token: string) {
       verificationToken: null,
       verificationExpiry: null,
       isEmailVerified: true,
+      emailVerifiedAt: new Date(),
+      status: "ACTIVE",
     },
   });
 
@@ -566,7 +759,7 @@ export async function updateAuthenticatedUser(userId: number | string, input: Pa
   };
 }
 
-export async function RequestResetPassword(emailInput: string) {
+export async function RequestResetPassword(emailInput: string, context?: AuthRequestContext) {
   const parsed = parseOrThrow(forgotPasswordSchema, { email: emailInput });
   const email = normalizeEmail(parsed.email);
   const user = await prisma.user.findUnique({ where: { email } });
@@ -577,15 +770,22 @@ export async function RequestResetPassword(emailInput: string) {
 
   const rawToken = generateToken();
   const resetToken = hashToken(rawToken);
-  const resetTokenExpiry = new Date(Date.now() + 1000 * 60 * 60);
+  const resetTokenExpiry = new Date(Date.now() + passwordResetTtlMs);
+
+  await prisma.passwordResetToken.create({
+    data: {
+      userId: user.id,
+      tokenHash: resetToken,
+      expiresAt: resetTokenExpiry,
+    },
+  });
 
   await prisma.user.update({
     where: { id: user.id },
-    data: {
-      resetToken,
-      resetTokenExpiry,
-    },
+    data: { resetToken, resetTokenExpiry },
   });
+
+  await recordSecurityEvent(user.id, "PASSWORD_RESET_REQUESTED", context);
 
   const resetUrl = `${process.env.NEXTAUTH_URL ?? "http://localhost:3000"}/reset-password?email=${encodeURIComponent(email)}&token=${encodeURIComponent(rawToken)}`;
   await sendAuthEmail({ to: user.email, name: user.name, type: "reset", actionUrl: resetUrl }).catch((error) => {
@@ -600,34 +800,69 @@ export async function ResetPassword(emailInput: string, token: string, password?
   const email = normalizeEmail(parsed.email);
   const user = await prisma.user.findUnique({ where: { email } });
 
-  if (!user?.resetToken || !user.resetTokenExpiry) {
+  if (!user) {
     throw new Error("Invalid reset token");
-  }
-
-  if (user.resetTokenExpiry.getTime() < Date.now()) {
-    throw new Error("Reset token has expired");
   }
 
   assertActiveAccount(user);
 
-  if (hashToken(parsed.token) !== user.resetToken) {
+  const tokenHash = hashToken(parsed.token);
+  const resetTokenRecord = await prisma.passwordResetToken.findFirst({
+    where: {
+      userId: user.id,
+      tokenHash,
+      usedAt: null,
+    },
+  });
+
+  if (!resetTokenRecord && tokenHash !== user.resetToken) {
     throw new Error("Invalid reset token");
   }
 
+  const resetTokenExpiry = resetTokenRecord?.expiresAt ?? user.resetTokenExpiry;
+  if (!resetTokenExpiry || resetTokenExpiry.getTime() < Date.now()) {
+    throw new Error("Reset token has expired");
+  }
+
   const hashedPassword = await bcrypt.hash(parsed.password, passwordRounds);
-  const result = await prisma.user.updateMany({
-    where: {
-      id: user.id,
-      resetToken: user.resetToken,
-      resetTokenExpiry: {
-        gt: new Date(),
+  const result = await prisma.$transaction(async (tx) => {
+    if (resetTokenRecord) {
+      const tokenUpdate = await tx.passwordResetToken.updateMany({
+        where: {
+          id: resetTokenRecord.id,
+          usedAt: null,
+          expiresAt: {
+            gt: new Date(),
+          },
+        },
+        data: {
+          usedAt: new Date(),
+        },
+      });
+
+      if (tokenUpdate.count !== 1) {
+        return { count: 0 };
+      }
+    }
+
+    return tx.user.updateMany({
+      where: {
+        id: user.id,
+        ...(resetTokenRecord ? {} : {
+          resetToken: tokenHash,
+          resetTokenExpiry: {
+            gt: new Date(),
+          },
+        }),
       },
-    },
-    data: {
-      resetToken: null,
-      resetTokenExpiry: null,
-      password: hashedPassword,
-    },
+      data: {
+        resetToken: null,
+        resetTokenExpiry: null,
+        password: hashedPassword,
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+      },
+    });
   });
 
   if (result.count !== 1) {
@@ -635,6 +870,32 @@ export async function ResetPassword(emailInput: string, token: string, password?
   }
 
   invalidateUserSessions(user.id);
+  await prisma.refreshToken.updateMany({
+    where: { userId: user.id, isRevoked: false },
+    data: { isRevoked: true, revokedAt: new Date() },
+  });
+  await prisma.session.updateMany({
+    where: { userId: user.id, isActive: true },
+    data: { isActive: false, lastSeenAt: new Date() },
+  });
+  await recordSecurityEvent(user.id, "PASSWORD_RESET_COMPLETED");
 
   return { message: "Password reset successful" };
+}
+
+export async function revokeRefreshToken(rawToken?: string) {
+  if (!rawToken) {
+    return;
+  }
+
+  await prisma.refreshToken.updateMany({
+    where: {
+      tokenHash: hashToken(rawToken),
+      isRevoked: false,
+    },
+    data: {
+      isRevoked: true,
+      revokedAt: new Date(),
+    },
+  });
 }

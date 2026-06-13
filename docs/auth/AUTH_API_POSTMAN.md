@@ -27,10 +27,11 @@ Origin: http://localhost:4000
 Important cookie behavior:
 
 ```text
-Login sets an httpOnly cookie named token.
+Login sets httpOnly cookies named token and refreshToken.
 Register does not set a login cookie; email verification is required before login.
 Postman stores this cookie automatically in its cookie jar.
 After login, protected routes like GET /api/auth/me should work without manually copying a token.
+Logout clears both cookies. Password reset revokes all stored refresh tokens for that user.
 ```
 
 Required backend env values:
@@ -42,6 +43,13 @@ NEXTAUTH_URL=http://localhost:4000
 RESEND_API_KEY optional for email sending
 GOOGLE_CLIENT_ID optional for Google OAuth
 GOOGLE_CLIENT_SECRET optional for Google OAuth
+```
+
+Optional device headers for login/register testing:
+
+```text
+X-Device-Id: postman-desktop
+X-Device-Name: Postman Desktop
 ```
 
 Recommended test order:
@@ -241,7 +249,7 @@ Expected response:
 Postman check:
 
 ```text
-The response sets/updates the token cookie.
+The response sets/updates the token and refreshToken cookies.
 Do not add Authorization header manually.
 ```
 
@@ -258,6 +266,14 @@ Unverified account error:
 ```json
 {
   "error": "Please verify your email before logging in"
+}
+```
+
+Repeated failed passwords are persisted in `LoginAttempt`, increment `failedLoginAttempts`, and can return:
+
+```json
+{
+  "error": "Account is temporarily locked. Try again later."
 }
 ```
 

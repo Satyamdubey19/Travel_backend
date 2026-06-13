@@ -1,4 +1,4 @@
-import { createSessionToken, getAuthUserById, getUserFromSessionToken, LoginUser, registerUser, updateAuthenticatedUser, VerifyEmail } from "@/modules/auth/services/auth.service";
+import { createSessionToken, getAuthUserById, getUserFromSessionToken, LoginUser, registerUser, revokeRefreshToken, updateAuthenticatedUser, VerifyEmail } from "@/modules/auth/services/auth.service";
 import { NextRequest } from "next/server";
 import { cookies } from "next/headers";
 import { ResetPassword,RequestResetPassword } from "@/modules/auth/services/auth.service";
@@ -7,12 +7,17 @@ import { authOptions } from "@/lib/auth";
 import { assertRateLimit, assertTrustedOrigin, clientIp, revokeToken } from "@/modules/auth/services/auth-security.service";
 
 const authCookieMaxAge = 60 * 60 * 24 * 7;
+const refreshCookieMaxAge = 60 * 60 * 24 * 30;
 const authCookieOptions = {
   httpOnly: true,
   path: "/",
   sameSite: "lax" as const,
   secure: process.env.NODE_ENV === "production",
   maxAge: authCookieMaxAge,
+};
+const refreshCookieOptions = {
+  ...authCookieOptions,
+  maxAge: refreshCookieMaxAge,
 };
 
 function errorStatus(error: unknown, fallback = 400) {
@@ -33,13 +38,22 @@ function normalizeLimiterEmail(value: unknown) {
   return typeof value === "string" ? value.trim().toLowerCase() : "unknown";
 }
 
+function authContext(request: NextRequest) {
+  return {
+    ipAddress: clientIp(request),
+    userAgent: request.headers.get("user-agent") ?? undefined,
+    deviceId: request.headers.get("x-device-id") ?? undefined,
+    deviceName: request.headers.get("x-device-name") ?? undefined,
+  };
+}
+
 export const register=async(request:NextRequest)=>{
   try{
     assertTrustedOrigin(request);
     assertRateLimit(`auth:register:ip:${clientIp(request)}`, 8, 60 * 1000);
     const body=await request.json();
     assertRateLimit(`auth:register:email:${normalizeLimiterEmail(body.email)}`, 3, 60 * 60 * 1000);
-    const {user}=await registerUser(body);
+    const {user}=await registerUser(body, authContext(request));
     return new Response(JSON.stringify({
       user,
       message:"Registration successful. Please verify your email before logging in."
@@ -55,8 +69,10 @@ export const login=async(request:NextRequest)=>{
     assertRateLimit(`auth:login:ip:${clientIp(request)}`, 20, 60 * 1000);
     const body=await request.json();
     assertRateLimit(`auth:login:email:${normalizeLimiterEmail(body.email)}:${clientIp(request)}`, 6, 15 * 60 * 1000);
-    const {user,token}=await LoginUser(body);
-    (await cookies()).set("token",token,authCookieOptions);
+    const {user,token,refreshToken}=await LoginUser(body, authContext(request));
+    const cookieStore = await cookies();
+    cookieStore.set("token",token,authCookieOptions);
+    cookieStore.set("refreshToken",refreshToken,refreshCookieOptions);
     return new Response(JSON.stringify({user}),{status:200,headers:{"Content-Type":"application/json"}});
   } catch (error) {
     const message = (error as Error).message;
@@ -72,7 +88,7 @@ export const forgotPassword=async(req:NextRequest)=>{
     assertRateLimit(`auth:forgot:ip:${clientIp(req)}`, 10, 60 * 1000);
     const {email}=await req.json();
     assertRateLimit(`auth:forgot:email:${normalizeLimiterEmail(email)}`, 3, 60 * 60 * 1000);
-    const result=await RequestResetPassword(email);
+    const result=await RequestResetPassword(email, authContext(req));
     return new Response(JSON.stringify(result),{
       status:201,
        headers: { "Content-Type": "application/json" },
@@ -185,10 +201,13 @@ export const logout=async(request?: NextRequest)=>{
   }
   const cookieStore = await cookies();
   const token = cookieStore.get("token")?.value;
+  const refreshToken = cookieStore.get("refreshToken")?.value;
   if (token) {
     revokeToken(token);
   }
+  await revokeRefreshToken(refreshToken);
   cookieStore.delete("token");
+  cookieStore.delete("refreshToken");
   return Response.json({ message: "Logged out" }, { status: 200 });
 }
 

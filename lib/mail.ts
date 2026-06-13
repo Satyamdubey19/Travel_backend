@@ -111,7 +111,7 @@ function buildAuthEmailHtml(content: AuthMailContent, actionUrl?: string) {
                             <tr>
                               <td style="width:33.33%;padding-right:8px;font-size:13px;line-height:1.5;color:#64748b">
                                 <strong style="display:block;color:#0f172a">Find stays</strong>
-                                Hotels and resorts
+                                Travel experiences
                               </td>
                               <td style="width:33.33%;padding:0 8px;font-size:13px;line-height:1.5;color:#64748b">
                                 <strong style="display:block;color:#0f172a">Plan trips</strong>
@@ -164,7 +164,7 @@ type BookingConfirmationInput = {
   to: string;
   guestName: string;
   bookingCode: string;
-  hotelName: string;
+  listingName: string;
   city?: string | null;
   checkIn: Date | string;
   checkOut: Date | string;
@@ -196,7 +196,7 @@ function buildBookingConfirmationHtml(input: BookingConfirmationInput) {
   const safeAppUrl = escapeHtml(appUrl);
   const bookingUrl = escapeHtml(input.bookingUrl ?? `${appUrl}/profile`);
   const guestName = escapeHtml(input.guestName.trim() || "there");
-  const hotelName = escapeHtml(input.hotelName);
+  const listingName = escapeHtml(input.listingName);
   const city = input.city ? escapeHtml(input.city) : "";
   const bookingCode = escapeHtml(input.bookingCode);
   const currency = input.currency ?? "INR";
@@ -233,7 +233,7 @@ function buildBookingConfirmationHtml(input: BookingConfirmationInput) {
             </div>
             <div style="padding:32px">
               <p style="margin:0 0 14px;font-size:18px;line-height:1.6;font-weight:700;color:#0f172a">Hello ${guestName},</p>
-              <p style="margin:0;font-size:15px;line-height:1.7;color:#475569">We created your booking hold for <strong>${hotelName}</strong>${city ? ` in ${city}` : ""}. Please complete payment before the hold expires to confirm the stay.</p>
+              <p style="margin:0;font-size:15px;line-height:1.7;color:#475569">We created your booking hold for <strong>${listingName}</strong>${city ? ` in ${city}` : ""}. Please complete payment before the hold expires to confirm the trip.</p>
 
               <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin:24px 0;border-radius:18px;background:#f8fafc;border:1px solid #e2e8f0;padding:18px">
                 <tr>
@@ -295,8 +295,8 @@ export async function sendBookingConfirmationEmail(input: BookingConfirmationInp
   await resend.emails.send({
     from: fromEmail,
     to: input.to,
-    subject: `Booking ${input.bookingCode} at ${input.hotelName}`,
-    text: `Hello ${input.guestName || "there"}, your booking hold ${input.bookingCode} at ${input.hotelName} is created for ${formatStayDate(input.checkIn)} to ${formatStayDate(input.checkOut)}. Total: ${formatMoney(input.totalAmount, input.currency ?? "INR")}.`,
+    subject: `Booking ${input.bookingCode} for ${input.listingName}`,
+    text: `Hello ${input.guestName || "there"}, your booking hold ${input.bookingCode} for ${input.listingName} is created for ${formatStayDate(input.checkIn)} to ${formatStayDate(input.checkOut)}. Total: ${formatMoney(input.totalAmount, input.currency ?? "INR")}.`,
     html: buildBookingConfirmationHtml(input),
   });
 }

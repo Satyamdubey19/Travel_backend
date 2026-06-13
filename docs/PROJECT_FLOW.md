@@ -126,6 +126,13 @@ User
 UserProfile
 UserTravelPreference
 RefreshToken
+Session
+OtpVerification
+PasswordResetToken
+LoginAttempt
+UserDevice
+EmailChangeRequest
+SecurityEvent
 AdminProfile
 Host
 KycApplication
@@ -155,15 +162,7 @@ DELETED
 ### Listing Models
 
 ```text
-Hotel
-Room
-RoomInventory
-RoomRate
-BlackoutDate
 Amenity
-HotelAmenity
-HotelImage
-HotelRule
 Tour
 TourItineraryDay
 Activity
@@ -187,13 +186,10 @@ ARCHIVED
 
 ```text
 Booking
-BookingRoom
-BookingGuest
 BookingTimeline
 Payment
 Coupon
 CouponRedemption
-InventoryReservation
 TourBooking
 TourTraveler
 WaitlistQueue
@@ -369,9 +365,10 @@ POST /api/auth/register
   -> apply in-memory rate limit
   -> check duplicate user
   -> hash password
-  -> create User with role USER
+  -> create PENDING User with role USER
   -> create pending Host profile if host signup was requested
   -> send email verification link
+  -> record SecurityEvent
   -> do not issue auth cookie
   -> return sanitized user
 ```
@@ -383,10 +380,14 @@ POST /api/auth/login
   -> find user by email
   -> run dummy bcrypt compare for missing users
   -> reject banned, inactive, deleted, or non-ACTIVE users
+  -> reject locked accounts
   -> require verified email
   -> compare bcrypt password
+  -> record failed LoginAttempt and update lockout counters on bad password
   -> check requested role if provided
-  -> issue JWT cookie
+  -> reset lockout counters on success
+  -> create LoginAttempt, SecurityEvent, Session, and hashed RefreshToken rows
+  -> issue JWT token cookie and refreshToken cookie
   -> return user with role and host info
 ```
 
@@ -407,8 +408,29 @@ GET /api/auth/me
 POST /api/auth/logout
   -> require trusted Origin/Referer
   -> revoke current JWT in process memory
-  -> clear auth cookie
+  -> revoke current refresh token in database
+  -> clear token and refreshToken cookies
   -> return success
+```
+
+### Password Reset
+
+```text
+POST /api/auth/forgot-password
+  -> normalize email
+  -> return generic message for missing/unusable accounts
+  -> create PasswordResetToken with SHA-256 tokenHash and 1 hour expiry
+  -> keep legacy User reset fields for backwards compatibility
+  -> send reset email
+
+POST /api/auth/reset-password
+  -> hash submitted token and find unused PasswordResetToken
+  -> reject expired or used token
+  -> mark token used atomically
+  -> update password
+  -> revoke all refresh tokens
+  -> deactivate sessions
+  -> invalidate current JWT sessions in process memory
 ```
 
 ### Host Activation
@@ -591,7 +613,6 @@ Moderated entities include:
 ```text
 USER
 HOST
-HOTEL
 TOUR
 RENTAL
 ACTIVITY
@@ -638,7 +659,6 @@ Host-related domains:
 ```text
 Host
 KycApplication
-Hotel
 Tour
 Rental
 Activity
@@ -647,30 +667,10 @@ Payout
 Review
 ```
 
-## Inventory Flow
+## Booking Expiry Flow
 
-Hotel inventory uses:
-
-```text
-Room
-RoomInventory
-RoomRate
-BlackoutDate
-InventoryReservation
-BookingRoom
-Booking
-```
-
-Expected booking behavior:
-
-1. Search checks available inventory for date range.
-2. Booking intent reserves room inventory.
-3. Pending booking gets an expiry.
-4. Payment confirmation marks booking confirmed.
-5. Expired unpaid booking releases inventory.
-6. Cancellation releases inventory according to status.
-
-The cron route and booking expiration services support cleanup.
+Pending booking records can expire if payment is not completed before their expiry time.
+The cron route and booking expiration service mark stale pending bookings as cancelled.
 
 ## Activity Flow
 
@@ -733,7 +733,6 @@ DELETE /api/wishlist
 Supported targets:
 
 ```text
-HOTEL
 TOUR
 RENTAL
 ACTIVITY

@@ -26,6 +26,8 @@ Custom auth
   -> email/password register and login
   -> bcrypt password hashing
   -> JWT session token stored in httpOnly cookie named token
+  -> hashed refresh token stored in httpOnly cookie named refreshToken
+  -> Session, RefreshToken, LoginAttempt, and SecurityEvent rows for auth state/audit
 
 NextAuth
   -> credentials provider support
@@ -56,6 +58,15 @@ Cookie options: httpOnly, sameSite=lax, path=/, maxAge=7 days
 Secure flag: true only in production
 JWT expiry: 7 days
 JWT secret priority: JWT_ACCESS_SECRET -> JWT_SECRET -> NEXTAUTH_SECRET
+```
+
+Credential login also creates a raw refresh token for the browser and stores only its SHA-256 hash in `RefreshToken`.
+
+```text
+Cookie name: refreshToken
+Cookie options: httpOnly, sameSite=lax, path=/, maxAge=30 days
+Database fields: tokenHash, deviceId, deviceName, ipAddress, userAgent, isRevoked, expiresAt
+Logout and password reset revoke matching refresh-token rows.
 ```
 
 Because the cookie is `httpOnly`, frontend JavaScript cannot read the JWT directly. The frontend checks the session by calling `GET /api/auth/me`.
@@ -168,7 +179,7 @@ request body
 POST /api/auth/login
 ```
 
-Authenticates by email and password, requires an active and verified account, optionally checks a requested role, sends a login alert email, and sets the `token` cookie.
+Authenticates by email and password, requires an active and verified account, optionally checks a requested role, sends a login alert email, sets the `token` cookie, and sets a hashed-refresh-token backed `refreshToken` cookie.
 
 Request:
 
@@ -204,6 +215,7 @@ Incorrect email or password
 This account does not have host access
 This account does not have admin access
 Please verify your email before logging in
+Account is temporarily locked. Try again later.
 JWT secret is not configured
 ```
 
@@ -214,13 +226,19 @@ normalize email
   -> find User by email
   -> require password field
   -> reject inactive, banned, deleted, or non-ACTIVE users
+  -> reject active lockouts
   -> reject unverified email
   -> bcrypt.compare(password, stored hash)
+  -> record failed attempt and apply lockout thresholds on bad password
   -> build auth user with Host info
   -> check requested role if type is provided
+  -> reset failedLoginAttempts and lockedUntil
+  -> create LoginAttempt and SecurityEvent rows
+  -> create Session row
+  -> create raw refresh token and store only tokenHash
   -> send login email
   -> create JWT
-  -> set httpOnly token cookie
+  -> set httpOnly token and refreshToken cookies
   -> return user
 ```
 
@@ -487,12 +505,14 @@ Internal flow:
 ```text
 normalize email
   -> find User
-  -> require resetToken and resetTokenExpiry
-  -> reject expired token
-  -> SHA-256 hash query token and compare with stored hash
+  -> find unused PasswordResetToken by SHA-256 token hash
+  -> reject expired or already-used token
   -> bcrypt.hash(new password, 12)
-  -> update password
-  -> clear resetToken and resetTokenExpiry
+  -> mark token used
+  -> update password and clear legacy reset fields
+  -> revoke refresh tokens
+  -> deactivate sessions
+  -> invalidate in-memory JWT sessions
 ```
 
 ### 9. Google Login Bridge
@@ -679,6 +699,11 @@ phone
 role
 status
 isEmailVerified
+emailVerifiedAt
+isPhoneVerified
+phoneVerifiedAt
+failedLoginAttempts
+lockedUntil
 verificationToken
 verificationExpiry
 resetToken
@@ -688,6 +713,19 @@ providerId
 lastLoginAt
 isActive
 isBanned
+```
+
+### Auth State And Audit Tables
+
+```text
+RefreshToken       hashed refresh tokens; plaintext tokens are never stored
+Session            active browser/device sessions and last-seen metadata
+PasswordResetToken one-time hashed reset tokens with expiry and usedAt
+LoginAttempt       successful/failed login attempts by email and IP
+OtpVerification    hashed OTP store for register/login/reset/email/phone flows
+UserDevice         known device IDs per user
+EmailChangeRequest pending verified email changes
+SecurityEvent      login, reset, lockout, and registration audit events
 ```
 
 ### Host

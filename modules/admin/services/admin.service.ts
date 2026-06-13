@@ -4,7 +4,7 @@ import type { AdminSession } from "@/utils/admin-auth"
 import type { ListQuery } from "@/utils/admin-query"
 
 type EntityType = "USER" | "HOST" | "BOOKING" | "LISTING" | "KYC" | "PAYOUT"
-type ListingType = "hotel" | "tour" | "rental" | "activity"
+type ListingType = "tour" | "rental" | "activity"
 type AdminListingUpdateInput = {
   status?: string
   reason?: string
@@ -72,7 +72,6 @@ export async function getAdminDashboard() {
     pendingKYC,
     approvedKYC,
     rejectedKYC,
-    hotelBookings,
     rentalBookings,
     activityBookings,
     pendingListings,
@@ -87,11 +86,9 @@ export async function getAdminDashboard() {
     prisma.kycApplication.count({ where: { status: "PENDING" } }),
     prisma.kycApplication.count({ where: { status: "APPROVED" } }),
     prisma.kycApplication.count({ where: { status: "REJECTED" } }),
-    prisma.booking.count(),
     prisma.rentalBooking.count(),
     prisma.activityBooking.count(),
     Promise.all([
-      prisma.hotel.count({ where: { status: "PENDING_REVIEW" } }),
       prisma.tour.count({ where: { status: "PENDING_REVIEW" } }),
       prisma.rental.count({ where: { status: "PENDING_REVIEW" } }),
       prisma.activity.count({ where: { status: "PENDING_REVIEW" } }),
@@ -101,7 +98,7 @@ export async function getAdminDashboard() {
     prisma.booking.findMany({
       orderBy: { createdAt: "desc" },
       take: 6,
-      include: { User: true, Hotel: true, Tour: true },
+      include: { User: true, Tour: true },
     }),
     prisma.user.findMany({
       orderBy: { createdAt: "desc" },
@@ -123,7 +120,7 @@ export async function getAdminDashboard() {
     stats: {
       totalUsers,
       totalHosts,
-      totalBookings: hotelBookings + rentalBookings + activityBookings,
+      totalBookings: rentalBookings + activityBookings,
       pendingKYC,
       approvedKYC,
       rejectedKYC,
@@ -131,14 +128,14 @@ export async function getAdminDashboard() {
       totalRevenue,
       totalPayouts,
       pendingPayouts,
-      confirmedBookings: await prisma.booking.count({ where: { status: "CONFIRMED" } }),
-      cancelledBookings: await prisma.booking.count({ where: { status: "CANCELLED" } }),
+      confirmedBookings: await prisma.booking.count({ where: { status: "CONFIRMED", tourId: { not: null } } }),
+      cancelledBookings: await prisma.booking.count({ where: { status: "CANCELLED", tourId: { not: null } } }),
     },
     recentBookings: recentBookings.map((booking) => ({
       id: booking.id,
       code: booking.bookingCode,
       guestName: booking.User.name,
-      listingName: booking.Hotel?.title ?? booking.Tour?.title ?? "Booking",
+      listingName: booking.Tour?.title ?? "Booking",
       status: booking.status,
       totalAmount: money(booking.totalAmount),
       createdAt: booking.createdAt.toISOString(),
@@ -165,13 +162,7 @@ export async function listAdminBookings(query: ListQuery) {
     include: {
       User: { select: { name: true, email: true } },
       Host: { include: { User: { select: { name: true } } } },
-      Hotel: { select: { title: true } },
       Tour: { select: { title: true } },
-      BookingRoom: {
-        include: {
-          Room: { select: { availableRooms: true, totalRooms: true } },
-        },
-      },
     },
   })
 
@@ -185,7 +176,6 @@ export async function listAdminBookings(query: ListQuery) {
         booking.User.email,
         booking.contactName,
         booking.contactEmail,
-        booking.Hotel?.title ?? "",
         booking.Tour?.title ?? "",
         booking.Host.businessName ?? booking.Host.User.name,
       ]
@@ -199,7 +189,6 @@ export async function listAdminBookings(query: ListQuery) {
       code: booking.bookingCode,
       guestName: booking.contactName || booking.User.name,
       guestEmail: booking.contactEmail || booking.User.email,
-      hotelName: booking.Hotel?.title,
       tourName: booking.Tour?.title,
       hostName: booking.Host.businessName ?? booking.Host.User.name,
       checkInDate: booking.checkIn?.toISOString(),
@@ -209,13 +198,7 @@ export async function listAdminBookings(query: ListQuery) {
       totalPrice: money(booking.totalAmount),
       status: booking.status.toLowerCase(),
       isOverridden: false,
-      rooms: booking.BookingRoom.map((room) => ({
-        id: room.id,
-        name: room.roomName,
-        quantity: room.quantity,
-        availableRooms: room.Room.availableRooms,
-        bookedRooms: Math.max(0, room.Room.totalRooms - room.Room.availableRooms),
-      })),
+      rooms: [],
       createdAt: booking.createdAt.toISOString(),
     })),
   }
@@ -225,17 +208,12 @@ export async function updateAdminBooking(id: string, admin: AdminSession, input:
   const nextStatus = input.status as BookingStatus
   const before = await prisma.booking.findUnique({
     where: { id },
-    include: { User: true, Payment: true, InventoryReservation: true, Tour: true },
+    include: { User: true, Payment: true, Tour: true },
   })
   if (!before) throw new Error("Booking not found")
 
   const booking = await prisma.$transaction(async (tx) => {
     if (nextStatus === "CONFIRMED") {
-      await tx.inventoryReservation.updateMany({
-        where: { bookingId: id, status: "ACTIVE" },
-        data: { status: "CONFIRMED" },
-      })
-
       if (before.tourId && before.Tour) {
         await tx.tourParticipant.upsert({
           where: { tourId_userId: { tourId: before.tourId, userId: before.userId } },
@@ -263,11 +241,6 @@ export async function updateAdminBooking(id: string, admin: AdminSession, input:
     }
 
     if (nextStatus === "CANCELLED") {
-      await tx.inventoryReservation.updateMany({
-        where: { bookingId: id, status: { in: ["ACTIVE", "CONFIRMED"] } },
-        data: { status: "CANCELLED" },
-      })
-
       if (before.tourId) {
         await tx.tourParticipant.updateMany({
           where: { bookingId: before.id, tourId: before.tourId },
@@ -291,7 +264,7 @@ export async function updateAdminBooking(id: string, admin: AdminSession, input:
           },
         },
       },
-      include: { Hotel: true, Tour: true, User: true },
+      include: { Tour: true, User: true },
     })
   })
 
@@ -358,7 +331,7 @@ export async function listAdminHosts(query: ListQuery) {
     orderBy: { createdAt: "desc" },
     include: {
       User: true,
-      _count: { select: { Hotel: true, Tour: true, Rental: true, Activity: true, Booking: true, RentalBooking: true, ActivityBooking: true } },
+      _count: { select: { Tour: true, Rental: true, Activity: true, Booking: true, RentalBooking: true, ActivityBooking: true } },
       Payment: { where: { status: "SUCCESS" }, select: { amount: true } },
     },
   })
@@ -382,7 +355,7 @@ export async function listAdminHosts(query: ListQuery) {
       isApproved: host.isApproved,
       isActive: host.isActive,
       kycStatus: host.kycStatus,
-      totalProperties: host._count.Hotel + host._count.Tour + host._count.Rental + host._count.Activity,
+      totalProperties: host._count.Tour + host._count.Rental + host._count.Activity,
       totalBookings: host._count.Booking + host._count.RentalBooking + host._count.ActivityBooking,
       revenue: host.Payment.reduce((sum, payment) => sum + money(payment.amount), 0),
       joinedAt: host.joinedAt.toISOString(),
@@ -534,43 +507,13 @@ export async function listAdminListings(query: ListQuery) {
   const includeType = (type: ListingType) => !requestedType || requestedType === "all" || requestedType === type
   const search = normalizeQuery(query.search)
 
-  const [hotels, tours, rentals, activities] = await Promise.all([
-    includeType("hotel") ? prisma.hotel.findMany({ include: { Host: { include: { User: true } }, Room: { orderBy: { createdAt: "asc" } }, _count: { select: { Booking: true, Review: true } } } }) : [],
+  const [tours, rentals, activities] = await Promise.all([
     includeType("tour") ? prisma.tour.findMany({ include: { Host: { include: { User: true } }, _count: { select: { Booking: true, Review: true } } } }) : [],
     includeType("rental") ? prisma.rental.findMany({ include: { Host: { include: { User: true } }, _count: { select: { RentalBooking: true, Review: true } } } }) : [],
     includeType("activity") ? prisma.activity.findMany({ include: { Host: { include: { User: true } }, _count: { select: { ActivityBooking: true, Review: true } } } }) : [],
   ])
 
   const rows = [
-    ...hotels.map((item) => ({
-      id: item.id,
-      type: "hotel" as const,
-      title: item.title,
-      ownerName: item.Host.businessName ?? item.Host.User.name,
-      city: item.city,
-      status: item.status,
-      isActive: item.isActive,
-      isApproved: item.isApproved,
-      price: item.Room.filter((room) => room.isActive).reduce((min, room) => {
-        const price = money(room.pricePerNight)
-        return min === 0 || price < min ? price : min
-      }, 0),
-      inventoryLabel: item.Room.length > 0
-        ? `${item.Room.filter((room) => room.isActive).reduce((sum, room) => sum + room.availableRooms, 0)} of ${item.Room.filter((room) => room.isActive).reduce((sum, room) => sum + room.totalRooms, 0)} rooms`
-        : "No rooms",
-      inventoryDetails: item.Room.map((room) => ({
-        id: room.id,
-        label: `${room.name} (${room.type})`,
-        pricePerNight: money(room.pricePerNight),
-        originalPrice: room.originalPrice == null ? undefined : money(room.originalPrice),
-        available: room.availableRooms,
-        total: room.totalRooms,
-        isActive: room.isActive,
-      })),
-      bookings: item._count.Booking,
-      reviews: item._count.Review,
-      createdAt: item.createdAt.toISOString(),
-    })),
     ...tours.map((item) => ({
       id: item.id,
       type: "tour" as const,
@@ -638,7 +581,6 @@ export async function listAdminPosts(query: ListQuery) {
     orderBy: { createdAt: query.sortOrder },
     include: {
       User: { select: { id: true, name: true, email: true, role: true, status: true } },
-      Hotel: { select: { id: true, title: true, city: true } },
       Tour: { select: { id: true, title: true, city: true, destination: true } },
       _count: { select: { PostComment: true, PostLike: true } },
     },
@@ -649,8 +591,6 @@ export async function listAdminPosts(query: ListQuery) {
       post.caption ?? "",
       post.User.name,
       post.User.email,
-      post.Hotel?.title ?? "",
-      post.Hotel?.city ?? "",
       post.Tour?.title ?? "",
       post.Tour?.city ?? "",
       post.Tour?.destination ?? "",
@@ -674,11 +614,9 @@ export async function listAdminPosts(query: ListQuery) {
         role: post.User.role,
         status: post.User.status,
       },
-      listing: post.Hotel
-        ? { type: "hotel", id: post.Hotel.id, title: post.Hotel.title, location: post.Hotel.city }
-        : post.Tour
-          ? { type: "tour", id: post.Tour.id, title: post.Tour.title, location: post.Tour.city ?? post.Tour.destination }
-          : null,
+      listing: post.Tour
+        ? { type: "tour", id: post.Tour.id, title: post.Tour.title, location: post.Tour.city ?? post.Tour.destination }
+        : null,
       createdAt: post.createdAt.toISOString(),
       updatedAt: post.updatedAt.toISOString(),
     })),
@@ -702,36 +640,6 @@ export async function updateAdminListing(type: ListingType, id: string, admin: A
     approvedAt: input.status === "ACTIVE" ? reviewedAt : input.status ? null : undefined,
     rejectedAt: input.status === "REJECTED" ? reviewedAt : input.status === "ACTIVE" || input.status === "PENDING_REVIEW" ? null : undefined,
     rejectionReason: input.status === "REJECTED" ? input.reason ?? null : input.status === "ACTIVE" || input.status === "PENDING_REVIEW" ? null : undefined,
-  }
-
-  if (type === "hotel") {
-    const before = await prisma.hotel.findUnique({ where: { id }, include: { Room: true } })
-    if (!before) throw new Error("Listing not found")
-    const listing = await prisma.$transaction(async (tx) => {
-      if (input.rooms?.length) {
-        for (const room of input.rooms) {
-          if (!room.id || !before.Room.some((existing) => existing.id === room.id)) continue
-          const totalRooms = room.totalRooms == null ? undefined : Math.max(Math.trunc(room.totalRooms), 1)
-          const availableRooms = room.availableRooms == null
-            ? undefined
-            : Math.max(Math.trunc(room.availableRooms), 0)
-          await tx.room.update({
-            where: { id: room.id },
-            data: {
-              pricePerNight: room.pricePerNight == null ? undefined : room.pricePerNight,
-              originalPrice: room.originalPrice,
-              totalRooms,
-              availableRooms: totalRooms == null || availableRooms == null ? availableRooms : Math.min(availableRooms, totalRooms),
-              isActive: room.isActive,
-            },
-          })
-        }
-      }
-
-      return tx.hotel.update({ where: { id }, data: approvalData })
-    })
-    await writeAuditLog(admin, `LISTING_${input.status ?? "UPDATED"}`, "LISTING", id, before, { ...input, type })
-    return listing
   }
 
   if (type === "tour") {
