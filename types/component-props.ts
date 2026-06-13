@@ -16,7 +16,7 @@ export type PlanHolidayProps = {
   cards: PlanHolidayCard[];
 };
 
-export type HotelCardProps = {
+export type TravelCardProps = {
   id?: string;
   title: string;
   location: string;

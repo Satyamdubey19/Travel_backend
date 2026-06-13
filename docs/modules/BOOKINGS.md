@@ -45,7 +45,7 @@ POST /api/tour-bookings/[bookingId]/cancel
 GET /api/my-bookings
   -> authenticate user
   -> query unified booking history
-  -> group or normalize hotel/tour/activity/rental bookings where supported
+  -> group or normalize tour/activity/rental bookings where supported
   -> return { success: true, data: bookings }
 ```
 

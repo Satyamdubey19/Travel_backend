@@ -155,10 +155,10 @@ export async function adminPosts(request: NextRequest) {
 export async function adminUpdateListing(request: NextRequest, context: RouteParams) {
   return withAdmin(request, async (admin) => {
     const { type, id } = await context.params
-    if (!["hotel", "tour", "rental", "activity"].includes(type)) {
+    if (!["tour", "rental", "activity"].includes(type)) {
       return fail("Invalid listing type", 400)
     }
     const input = await parseListingUpdate(request)
-    return ok(await updateAdminListing(type as "hotel" | "tour" | "rental" | "activity", id, admin, input))
+    return ok(await updateAdminListing(type as "tour" | "rental" | "activity", id, admin, input))
   })
 }

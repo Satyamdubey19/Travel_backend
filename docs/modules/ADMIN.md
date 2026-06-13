@@ -108,7 +108,7 @@ PATCH /api/admin/kyc/[id]
 ```text
 GET /api/admin/listings
   -> require ADMIN
-  -> list hotels, tours, rentals, activities by status/type
+  -> list tours, rentals, activities by status/type
 
 PATCH /api/admin/listings/[type]/[id]
   -> require ADMIN
@@ -118,7 +118,6 @@ PATCH /api/admin/listings/[type]/[id]
 Supported listing types should match service handling:
 
 ```text
-hotel
 tour
 rental
 activity

@@ -36,7 +36,7 @@ export async function POST(req: NextRequest) {
     const dataUri = `data:${file.type};base64,${b64}`
 
     const result = await cloudinary.uploader.upload(dataUri, {
-      folder: "gethotels/hotels",
+      folder: "gethotels/travel",
       resource_type: "auto",
     })
 

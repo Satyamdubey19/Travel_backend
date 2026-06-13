@@ -28,7 +28,7 @@ export type Tour = {
   description: string;
   highlights: string[];
   itinerary: Itinerary[];
-  includedHotels: string[];
+  includedStays: string[];
   bestTimeToVisit: string;
   category: string;
   tags: string[];
@@ -83,9 +83,9 @@ export const tours: Tour[] = [
       {
         day: 1,
         title: "Arrival in Manali",
-        description: "Arrive in Manali, check into hotel, explore local markets",
+        description: "Arrive in Manali, settle in, and explore local markets",
         activities: [
-          "Hotel check-in",
+          "Arrival support",
           "Local market exploration",
           "Evening walk in Old Manali",
         ],
@@ -120,7 +120,7 @@ export const tours: Tour[] = [
         meals: ["Breakfast"],
       },
     ],
-    includedHotels: ["seyfert-sarovar", "ramada-resort", "taj-crystal"],
+    includedStays: ["Included group accommodation"],
     bestTimeToVisit: "March to June, September to November",
     category: "adventure",
     tags: ["trekking", "mountain", "paragliding", "snow"],
@@ -177,7 +177,7 @@ export const tours: Tour[] = [
         title: "Arrival in Kochi",
         description: "Arrive in Kochi, check-in, explore historic Kochi Fort",
         activities: [
-          "Hotel check-in",
+          "Arrival support",
           "Chinese fishing nets visit",
           "Fort Kochi exploration",
         ],
@@ -210,7 +210,7 @@ export const tours: Tour[] = [
         meals: ["Breakfast"],
       },
     ],
-    includedHotels: ["royal-vista", "ramada-resort"],
+    includedStays: ["Included group accommodation"],
     bestTimeToVisit: "October to February",
     category: "relaxation",
     tags: ["beach", "houseboat", "ayurveda", "backwaters"],
@@ -249,14 +249,14 @@ export const tours: Tour[] = [
     category: "cultural",
     tags: ["heritage", "palace", "desert", "history"],
     itinerary: [
-      { day: 1, title: "Arrival in Jaipur", description: "Check in and explore local markets", activities: ["Hotel check-in", "Johri Bazaar shopping", "Welcome dinner"], meals: ["Dinner"] },
+      { day: 1, title: "Arrival in Jaipur", description: "Settle in and explore local markets", activities: ["Arrival support", "Johri Bazaar shopping", "Welcome dinner"], meals: ["Dinner"] },
       { day: 2, title: "Jaipur Forts & Palaces", description: "Visit Amber Fort and City Palace", activities: ["Amber Fort", "City Palace", "Hawa Mahal", "Jantar Mantar"], meals: ["Breakfast", "Lunch", "Dinner"] },
       { day: 3, title: "Desert Experience", description: "Camel safari and desert camping", activities: ["Camel safari", "Desert camping", "Folk music night"], meals: ["Breakfast", "Lunch", "Dinner"] },
       { day: 4, title: "Travel to Udaipur", description: "Scenic drive to the City of Lakes", activities: ["Scenic drive", "Chittorgarh Fort stop", "Udaipur check-in"], meals: ["Breakfast", "Lunch", "Dinner"] },
       { day: 5, title: "Udaipur Exploration", description: "Lake Pichola and City Palace", activities: ["City Palace Udaipur", "Lake Pichola boat ride", "Sunset viewing"], meals: ["Breakfast", "Lunch", "Dinner"] },
       { day: 6, title: "Departure", description: "Final breakfast and departure", activities: ["Breakfast", "Souvenir shopping", "Departure"], meals: ["Breakfast"] },
     ],
-    includedHotels: ["royal-vista", "taj-crystal"],
+    includedStays: ["Included group accommodation"],
     bestTimeToVisit: "October to March",
     budget: {
       perPersonBase: 18000,
@@ -286,7 +286,7 @@ export const tours: Tour[] = [
       { day: 2, title: "Heritage & Adventure", description: "Old Goa churches and Dudhsagar Falls", activities: ["Old Goa churches", "Dudhsagar Falls trip", "Spice plantation visit"], meals: ["Breakfast", "Lunch", "Dinner"] },
       { day: 3, title: "South Goa & Departure", description: "Peaceful South Goa beaches and departure", activities: ["Palolem Beach", "Souvenir shopping", "Departure"], meals: ["Breakfast", "Lunch"] },
     ],
-    includedHotels: ["seyfert-sarovar"],
+    includedStays: ["Included group accommodation"],
     bestTimeToVisit: "November to February",
     budget: {
       perPersonBase: 8000,
@@ -317,7 +317,7 @@ export const tours: Tour[] = [
       { day: 3, title: "Adventure Day", description: "River rafting and elephant interaction", activities: ["River rafting", "Elephant safari", "Jungle campfire"], meals: ["Breakfast", "Lunch", "Dinner"] },
       { day: 4, title: "Departure", description: "Morning bird watching and departure", activities: ["Morning bird watching", "Breakfast", "Departure"], meals: ["Breakfast"] },
     ],
-    includedHotels: ["ramada-resort"],
+    includedStays: ["Included group accommodation"],
     bestTimeToVisit: "November to June",
     budget: {
       perPersonBase: 14000,
@@ -349,7 +349,7 @@ export const tours: Tour[] = [
       { day: 4, title: "Neil Island", description: "Day trip to Neil Island", activities: ["Ferry to Neil Island", "Natural Bridge", "Glass-bottom boat ride", "Return to Havelock"], meals: ["Breakfast", "Lunch", "Dinner"] },
       { day: 5, title: "Departure", description: "Return to Port Blair and departure", activities: ["Ferry to Port Blair", "Shopping", "Departure"], meals: ["Breakfast"] },
     ],
-    includedHotels: ["royal-vista", "seyfert-sarovar"],
+    includedStays: ["Included group accommodation"],
     bestTimeToVisit: "October to May",
     budget: {
       perPersonBase: 22000,
