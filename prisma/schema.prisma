@@ -532,6 +532,7 @@ model RefreshToken {
 model Session {
   id         String   @id @default(uuid())
   userId     String
+  deviceId   String?
   deviceName String?
   deviceType String?
   ipAddress  String?
@@ -542,6 +543,7 @@ model Session {
   User       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
+  @@index([deviceId])
   @@index([isActive])
   @@index([lastSeenAt])
 }
@@ -592,16 +594,26 @@ model LoginAttempt {
 }
 
 model UserDevice {
-  id         String   @id @default(uuid())
-  userId     String
-  deviceId   String
-  deviceType String
-  ipAddress  String?
-  createdAt  DateTime @default(now())
-  User       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id               String   @id @default(uuid())
+  userId           String
+  deviceId         String
+  deviceName       String?
+  deviceType       String   @default("browser")
+  browser          String?
+  os               String?
+  ipAddress        String?
+  userAgent        String?
+  lastSeenAt       DateTime @default(now())
+  createdAt        DateTime @default(now())
+  isCurrent        Boolean  @default(false)
+  isActive         Boolean  @default(true)
+  refreshTokenHash String?
+  User             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, deviceId])
   @@index([userId])
+  @@index([deviceId])
+  @@index([isActive])
 }
 
 model EmailChangeRequest {

@@ -1,7 +1,7 @@
 # Auth Adversarial Testing Report
 
 Audit date: 2026-06-12  
-Remediation update: 2026-06-12  
+Remediation update: 2026-06-14  
 Target base URL: `http://localhost:4000`  
 Scope: auth endpoints, JWT cookies, NextAuth integration, role behavior, password reset, email verification, CSRF, user enumeration, and race conditions.
 
@@ -24,12 +24,14 @@ No-Origin auth mutations are rejected; Origin or Referer must be trusted.
 Google OAuth now requires email_verified=true and rejects missing email_verified.
 Middleware now verifies protected page sessions through /api/auth/me, reusing DB/status/revocation checks.
 Same-second session invalidation now rejects tokens with iat <= invalidated timestamp.
+Redis-backed auth rate limits, email verification-token storage, and refresh-token storage are available when REDIS_URL is configured.
+Login now enforces a maximum of 3 active devices and returns DEVICE_LIMIT_REACHED with active devices instead of issuing tokens on a 4th device.
 ```
 
 Still needs production hardening:
 
 ```text
-Rate limiting and token/session invalidation are still process-memory based.
+JWT access-token revocation and session invalidation are still process-memory based.
 Registration can still reveal account existence through conflict behavior unless changed to a fully generic signup response.
 Legacy /api/verify remains and should be removed or delegated.
 Stored profile text still needs frontend output-escaping guarantees.
@@ -42,7 +44,7 @@ Current risk level: Medium-High
 Major remaining attack paths:
 
 ```text
-1. Custom JWT revocation and rate limits are process-memory only.
+1. Custom JWT revocation/session invalidation is process-memory only.
 2. Registration conflict behavior can still expose account existence.
 3. GET email verification is a state-changing GET and legacy /api/verify remains.
 4. JWT forgery is possible if any JWT/NEXTAUTH secret is weak or leaked.
@@ -391,7 +393,7 @@ Or make middleware use NextAuth/session database checks where feasible.
 
 Goal: spam reset emails or enumerate accounts.
 
-Status: Partially blocked by in-memory rate limiting and generic success response.
+Status: Blocked by Redis-backed rate limiting when REDIS_URL is configured, plus generic success response.
 
 PoC:
 
@@ -408,21 +410,20 @@ Expected current result:
 
 ```text
 First few return 201 generic message.
-Later requests return 429 in same process.
+Later requests return 429. With REDIS_URL configured, this is shared across app instances.
 ```
 
 Bypass conditions:
 
 ```text
 Use many IPs.
-Server restart clears limiter.
-Multi-instance deployment has separate rate stores.
+REDIS_URL missing, causing local process-memory fallback.
 ```
 
 Fix:
 
 ```text
-Use Redis-backed rate limits.
+Keep Redis-backed rate limits enabled in production.
 Add CAPTCHA or abuse detection after threshold.
 Log reset attempts.
 ```
@@ -704,7 +705,7 @@ Require Origin for browser mutation endpoints if API clients are not needed.
 
 Goal: bypass brute-force protection.
 
-Status: Viable in multi-instance/serverless/restart scenarios.
+Status: Blocked for Redis-enabled deployments. Viable only if REDIS_URL is missing and the app falls back to process-memory limits.
 
 PoC:
 
@@ -720,21 +721,20 @@ done
 Expected current single-process result:
 
 ```text
-429 after configured threshold.
+429 after configured threshold. With REDIS_URL configured, counters are shared through Redis.
 ```
 
 Bypass:
 
 ```text
-Restart server.
-Route requests across multiple instances.
 Rotate IP addresses.
+Run without REDIS_URL, then restart or route across multiple instances.
 ```
 
 Fix:
 
 ```text
-Use Redis/database rate limiter keyed by email, IP, subnet, and user-agent/device fingerprint.
+Keep Redis/database rate limiter keyed by email, IP, subnet, and user-agent/device fingerprint.
 ```
 
 ## Attack Path 16 - Session Invalidation Same-Second Edge
@@ -921,7 +921,7 @@ Optionally reject angle brackets for fields that should be handles/names only.
 Critical/High:
 
 ```text
-1. Move rate limits and session revocation to Redis/database.
+1. Move JWT access-token revocation/session invalidation to Redis/database or User.sessionVersion.
 2. Remove or delegate legacy /api/verify.
 3. Add automated regression tests for host onboarding, middleware auth, and reset-token races.
 ```
@@ -965,8 +965,11 @@ no-Origin mutation behavior matches final CSRF policy
 stale HOST token fails after user role/status change
 Google profile without email_verified is rejected
 legacy /api/verify does not mislead clients
+4th active device login does not create token/session/refresh token
+replace-device cannot logout another user's device
+replace-device deactivates selected device and logs in current device
 ```
 
 ## Final Assessment
 
-The auth module is stronger after remediation. Direct host/admin privilege escalation, unverified login, reset-token replay, stale middleware token access, and no-Origin mutation attempts are now blocked by the current implementation. The remaining serious weakness is operational: rate limiting and token/session revocation are process-memory based, so they do not survive restarts and do not work across multiple server instances. Persist those controls in Redis or the database before production use with real users or hosts.
+The auth module is stronger after remediation. Direct host/admin privilege escalation, unverified login, reset-token replay, stale middleware token access, and no-Origin mutation attempts are now blocked by the current implementation. Redis now covers rate limits, email verification-token storage, and refresh-token state when REDIS_URL is configured. The remaining operational weakness is JWT access-token revocation/session invalidation, which is still process-memory based and should be persisted before multi-instance production use.

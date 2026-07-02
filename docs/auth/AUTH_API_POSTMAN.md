@@ -28,21 +28,35 @@ Important cookie behavior:
 
 ```text
 Login sets httpOnly cookies named token and refreshToken.
+Login also sets an httpOnly deviceId cookie.
 Register does not set a login cookie; email verification is required before login.
 Postman stores this cookie automatically in its cookie jar.
 After login, protected routes like GET /api/auth/me should work without manually copying a token.
-Logout clears both cookies. Password reset revokes all stored refresh tokens for that user.
+Logout clears both cookies and deletes the matching Redis refresh-token entry.
+Password reset deletes all Redis refresh tokens for that user and deactivates sessions.
+A maximum of 3 active devices is allowed per user.
 ```
 
 Required backend env values:
 
 ```text
 DATABASE_URL
+REDIS_URL recommended for shared rate limits, verification tokens, and refresh-token state
 JWT_ACCESS_SECRET or JWT_SECRET or NEXTAUTH_SECRET
 NEXTAUTH_URL=http://localhost:4000
 RESEND_API_KEY optional for email sending
 GOOGLE_CLIENT_ID optional for Google OAuth
 GOOGLE_CLIENT_SECRET optional for Google OAuth
+```
+
+Redis behavior:
+
+```text
+Register stores the hashed email verification token in Redis when REDIS_URL is configured.
+Login stores the hashed refresh-token metadata in Redis when REDIS_URL is configured.
+Login stores active device sessions in Redis when REDIS_URL is configured.
+Auth rate limits use Redis when REDIS_URL is configured and fall back to process memory locally.
+Without Redis, verification and refresh-token storage fall back to database fields where implemented.
 ```
 
 Optional device headers for login/register testing:
@@ -59,14 +73,16 @@ Recommended test order:
 2. Verify email
 3. Login
 4. Get current user
-5. Update profile
-6. Logout
-7. Forgot password
-8. Reset password
-9. Register host
-10. Verify host email
-11. Confirm host cannot log in as HOST until approved/promoted
-12. Become host from normal user creates pending Host profile only
+5. List devices
+6. Logout selected device if needed
+7. Update profile
+8. Logout
+9. Forgot password
+10. Reset password
+11. Register host
+12. Verify host email
+13. Confirm host cannot log in as HOST until approved/promoted
+14. Become host from normal user creates pending Host profile only
 ```
 
 ## Endpoint Summary
@@ -74,8 +90,11 @@ Recommended test order:
 ```text
 POST /api/auth/register
 POST /api/auth/login
+POST /api/auth/login/replace-device
 GET  /api/auth/me
 PATCH /api/auth/me
+GET  /api/auth/devices
+POST /api/auth/devices/logout
 POST /api/auth/logout
 GET  /api/auth/verify?email=...&token=...
 POST /api/auth/forgot-password
@@ -249,7 +268,7 @@ Expected response:
 Postman check:
 
 ```text
-The response sets/updates the token and refreshToken cookies.
+The response sets/updates the token, refreshToken, and deviceId cookies.
 Do not add Authorization header manually.
 ```
 
@@ -274,6 +293,44 @@ Repeated failed passwords are persisted in `LoginAttempt`, increment `failedLogi
 ```json
 {
   "error": "Account is temporarily locked. Try again later."
+}
+```
+
+Device limit error:
+
+```json
+{
+  "error": "DEVICE_LIMIT_REACHED",
+  "message": "Maximum device limit reached",
+  "devices": [
+    {
+      "id": "postman-desktop",
+      "deviceId": "postman-desktop",
+      "deviceName": "Postman Desktop",
+      "browser": "Unknown",
+      "os": "Unknown",
+      "ipAddress": "127.0.0.1",
+      "lastSeenAt": "2026-06-14T10:00:00.000Z",
+      "isCurrent": false
+    }
+  ]
+}
+```
+
+Replace a device after limit is reached:
+
+```text
+Method: POST
+URL: {{base_url}}/api/auth/login/replace-device
+```
+
+Body:
+
+```json
+{
+  "email": "rahul.postman@example.com",
+  "password": "secret123",
+  "deviceToLogout": "postman-desktop"
 }
 ```
 
@@ -379,7 +436,56 @@ If this returns 401 after login, open Postman Cookies and confirm token exists f
 If token exists but still fails, check JWT_ACCESS_SECRET / JWT_SECRET / NEXTAUTH_SECRET.
 ```
 
-## 6. Update Current User Profile
+## 6. Device Sessions
+
+List active devices:
+
+```text
+Method: GET
+URL: {{base_url}}/api/auth/devices
+```
+
+Expected response:
+
+```json
+[
+  {
+    "id": "postman-desktop",
+    "deviceId": "postman-desktop",
+    "deviceName": "Postman Desktop",
+    "browser": "Unknown",
+    "os": "Unknown",
+    "ipAddress": "127.0.0.1",
+    "lastSeenAt": "2026-06-14T10:00:00.000Z",
+    "isCurrent": true
+  }
+]
+```
+
+Logout a selected device:
+
+```text
+Method: POST
+URL: {{base_url}}/api/auth/devices/logout
+```
+
+Body:
+
+```json
+{
+  "deviceId": "postman-desktop"
+}
+```
+
+Expected response:
+
+```json
+{
+  "message": "Device logged out"
+}
+```
+
+## 7. Update Current User Profile
 
 ```text
 Method: PATCH
@@ -449,7 +555,7 @@ Common errors:
 }
 ```
 
-## 7. Become Host
+## 8. Become Host
 
 ```text
 Method: PATCH
@@ -495,7 +601,7 @@ The token cookie may be refreshed, but role remains USER.
 Call GET /api/auth/me again to confirm role is not HOST until approval/promotion.
 ```
 
-## 8. Logout
+## 9. Logout
 
 ```text
 Method: POST
@@ -524,7 +630,7 @@ Postman check:
 After logout, GET /api/auth/me should return 401.
 ```
 
-## 9. Forgot Password
+## 10. Forgot Password
 
 ```text
 Method: POST
@@ -569,7 +675,7 @@ http://localhost:4000/reset-password?email=rahul.postman%40example.com&token=RAW
 Copy token from that URL.
 ```
 
-## 10. Reset Password
+## 11. Reset Password
 
 ```text
 Method: POST
@@ -620,7 +726,7 @@ Common errors:
 }
 ```
 
-## 11. Verify Email
+## 12. Verify Email
 
 ```text
 Method: GET
@@ -676,7 +782,7 @@ Do not test new verification with /api/verify?token=...
 That route is legacy and does not match the current hashed-token verification flow.
 ```
 
-## 12. Google Login Bridge
+## 13. Google Login Bridge
 
 ```text
 Method: GET
@@ -693,7 +799,8 @@ Frontend calls signIn("google", { callbackUrl: "/api/auth/google-login" })
   -> NextAuth creates session
   -> /api/auth/google-login reads session
   -> backend creates/updates User
-  -> backend sets custom token cookie
+  -> backend enforces the 3-device limit
+  -> backend sets token, refreshToken, and deviceId cookies
   -> redirects to app home
 ```
 
@@ -703,7 +810,13 @@ Direct Postman result without session:
 Redirects to /login
 ```
 
-## 13. NextAuth Catch-All
+Device-limit browser result:
+
+```text
+Redirects to /login?error=DEVICE_LIMIT_REACHED
+```
+
+## 14. NextAuth Catch-All
 
 ```text
 GET  /api/auth/[...nextauth]

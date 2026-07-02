@@ -4,14 +4,30 @@ import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { generateToken, hashToken } from "@/lib/hash";
 import { sendAuthEmail, sendVerificationEmail } from "@/lib/mail";
-import type { Gender, Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
+import type { Gender } from "@prisma/client";
 import type { AuthRole, LoginInput, RegisterInput } from "@/modules/auth/types/auth";
 import { invalidateUserSessions, isTokenRevoked, isUserSessionInvalidated } from "@/modules/auth/services/auth-security.service";
+import {
+  deleteEmailVerificationToken,
+  deleteActiveDeviceSession,
+  deleteRefreshToken,
+  deleteUserActiveDeviceSessions,
+  deleteUserRefreshTokens,
+  getEmailVerificationToken,
+  setEmailVerificationToken,
+  storeActiveDeviceSession,
+  storeRefreshToken,
+} from "@/services/redis.service";
 
 const passwordRounds = 12;
 const sessionTtl = "7d";
 const refreshTokenTtlMs = 1000 * 60 * 60 * 24 * 30;
+const refreshTokenTtlSeconds = refreshTokenTtlMs / 1000;
+const maxActiveDevices = 3;
 const passwordResetTtlMs = 1000 * 60 * 60;
+const emailVerificationTtlMs = 1000 * 60 * 60 * 24;
+const emailVerificationTtlSeconds = emailVerificationTtlMs / 1000;
 const dummyPasswordHash = "$2b$12$J5mwthkzJDbOt3ElCdU5/uCF9tUoz0B0brOcFVAw4DvIN7uo/LCO6";
 
 interface GoogleAuthInput {
@@ -41,7 +57,31 @@ export type AuthRequestContext = {
   userAgent?: string;
   deviceId?: string;
   deviceName?: string;
+  browser?: string;
+  os?: string;
 };
+
+type DeviceListItem = {
+  id: string;
+  deviceId: string;
+  deviceName: string | null;
+  browser: string | null;
+  os: string | null;
+  ipAddress: string | null;
+  lastSeenAt: Date;
+  isCurrent: boolean;
+};
+
+export class DeviceLimitReachedError extends Error {
+  statusCode = 409;
+  code = "DEVICE_LIMIT_REACHED";
+  devices: DeviceListItem[];
+
+  constructor(devices: DeviceListItem[]) {
+    super("Maximum device limit reached");
+    this.devices = devices;
+  }
+}
 
 const phoneSchema = z
   .string()
@@ -74,6 +114,10 @@ const resetPasswordSchema = z.object({
   email: z.string().trim().email("Valid email is required").max(254, "Email is too long"),
   token: z.string().trim().min(1, "Reset token is required"),
   password: z.string().min(6, "Password must be at least 6 characters").max(128, "Password must be 128 characters or less"),
+}).strict();
+
+const replaceDeviceLoginSchema = loginSchema.extend({
+  deviceToLogout: z.string().trim().min(1, "Device to logout is required"),
 }).strict();
 
 const optionalTrimmedString = (max: number, field: string) =>
@@ -194,6 +238,8 @@ function sanitizedContext(context?: AuthRequestContext) {
     userAgent: context?.userAgent?.slice(0, 500),
     deviceId: context?.deviceId?.slice(0, 120),
     deviceName: context?.deviceName?.slice(0, 160),
+    browser: context?.browser?.slice(0, 80),
+    os: context?.os?.slice(0, 80),
   };
 }
 
@@ -256,54 +302,139 @@ async function registerFailedLogin(user: DbUser, email: string, context?: AuthRe
   await recordSecurityEvent(user.id, lockedUntil ? "ACCOUNT_LOCKED" : "LOGIN_FAILED", context, { failedLoginAttempts: attempts });
 }
 
+function toDeviceListItem(device: {
+  deviceId: string;
+  deviceName?: string | null;
+  browser?: string | null;
+  os?: string | null;
+  ipAddress?: string | null;
+  lastSeenAt?: Date | null;
+  isCurrent?: boolean | null;
+}): DeviceListItem {
+  return {
+    id: device.deviceId,
+    deviceId: device.deviceId,
+    deviceName: device.deviceName ?? null,
+    browser: device.browser ?? null,
+    os: device.os ?? null,
+    ipAddress: device.ipAddress ?? null,
+    lastSeenAt: device.lastSeenAt ?? new Date(),
+    isCurrent: Boolean(device.isCurrent),
+  };
+}
+
+async function listActiveDevicesForUser(userId: string, currentDeviceId?: string) {
+  const devices = await prisma.userDevice.findMany({
+    where: { userId, isActive: true },
+    orderBy: { lastSeenAt: "desc" },
+  });
+
+  return devices.map((device) => toDeviceListItem({
+    ...device,
+    isCurrent: currentDeviceId ? device.deviceId === currentDeviceId : device.isCurrent,
+  }));
+}
+
 async function createRefreshAuth(user: Pick<DbUser, "id">, context?: AuthRequestContext) {
   const ctx = sanitizedContext(context);
+  const deviceId = ctx.deviceId || "unknown";
   const rawRefreshToken = generateToken();
+  const tokenHash = hashToken(rawRefreshToken);
   const expiresAt = new Date(Date.now() + refreshTokenTtlMs);
 
-  await prisma.session.create({
-    data: {
-      userId: user.id,
-      deviceName: ctx.deviceName,
-      deviceType: ctx.deviceId ? "known" : "browser",
-      ipAddress: ctx.ipAddress,
-      userAgent: ctx.userAgent,
-    },
-  });
+  await prisma.$transaction(async (tx) => {
+    const activeDevices = await tx.userDevice.findMany({
+      where: { userId: user.id, isActive: true },
+      orderBy: { lastSeenAt: "desc" },
+    });
+    const currentDevice = activeDevices.find((device) => device.deviceId === deviceId);
 
-  await prisma.refreshToken.create({
-    data: {
-      userId: user.id,
-      tokenHash: hashToken(rawRefreshToken),
-      deviceId: ctx.deviceId,
-      deviceName: ctx.deviceName,
-      ipAddress: ctx.ipAddress,
-      userAgent: ctx.userAgent,
-      expiresAt,
-    },
-  });
+    if (!currentDevice && activeDevices.length >= maxActiveDevices) {
+      throw new DeviceLimitReachedError(activeDevices.map(toDeviceListItem));
+    }
 
-  if (ctx.deviceId) {
-    await prisma.userDevice.upsert({
+    await tx.session.updateMany({
+      where: { userId: user.id, deviceId, isActive: true },
+      data: { isActive: false, lastSeenAt: new Date() },
+    });
+
+    await tx.session.create({
+      data: {
+        userId: user.id,
+        deviceId,
+        deviceName: ctx.deviceName,
+        deviceType: "browser",
+        ipAddress: ctx.ipAddress,
+        userAgent: ctx.userAgent,
+      },
+    });
+
+    await tx.refreshToken.create({
+      data: {
+        userId: user.id,
+        tokenHash,
+        deviceId,
+        deviceName: ctx.deviceName,
+        ipAddress: ctx.ipAddress,
+        userAgent: ctx.userAgent,
+        expiresAt,
+      },
+    });
+
+    await tx.userDevice.updateMany({
+      where: { userId: user.id, isCurrent: true },
+      data: { isCurrent: false },
+    });
+
+    await tx.userDevice.upsert({
       where: {
         userId_deviceId: {
           userId: user.id,
-          deviceId: ctx.deviceId,
+          deviceId,
         },
       },
       create: {
         userId: user.id,
-        deviceId: ctx.deviceId,
+        deviceId,
+        deviceName: ctx.deviceName,
         deviceType: "browser",
+        browser: ctx.browser,
+        os: ctx.os,
         ipAddress: ctx.ipAddress,
+        userAgent: ctx.userAgent,
+        lastSeenAt: new Date(),
+        isCurrent: true,
+        isActive: true,
+        refreshTokenHash: tokenHash,
       },
       update: {
+        deviceName: ctx.deviceName,
+        browser: ctx.browser,
+        os: ctx.os,
         ipAddress: ctx.ipAddress,
+        userAgent: ctx.userAgent,
+        lastSeenAt: new Date(),
+        isCurrent: true,
+        isActive: true,
+        refreshTokenHash: tokenHash,
       },
-    }).catch((error) => {
-      console.error("Failed to upsert user device:", error);
     });
-  }
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+
+  await storeRefreshToken(tokenHash, {
+    userId: user.id,
+    deviceId,
+    deviceName: ctx.deviceName,
+    ipAddress: ctx.ipAddress,
+    userAgent: ctx.userAgent,
+    createdAt: new Date().toISOString(),
+  }, refreshTokenTtlSeconds).catch((error) => {
+    console.error("Failed to store refresh token in Redis:", error);
+  });
+
+  await storeActiveDeviceSession(user.id, deviceId, refreshTokenTtlSeconds).catch((error) => {
+    console.error("Failed to store active device session in Redis:", error);
+  });
 
   return rawRefreshToken;
 }
@@ -417,7 +548,7 @@ export async function registerUser(input: RegisterInput, context?: AuthRequestCo
   const hashedPassword = await bcrypt.hash(parsed.password, passwordRounds);
   const rawToken = generateToken();
   const verificationToken = hashToken(rawToken);
-  const verificationExpiry = new Date(Date.now() + 1000 * 60 * 60 * 24);
+  const verificationExpiry = new Date(Date.now() + emailVerificationTtlMs);
 
   let user;
   try {
@@ -451,6 +582,21 @@ export async function registerUser(input: RegisterInput, context?: AuthRequestCo
     });
   }
 
+  const storedVerificationInRedis = await setEmailVerificationToken(email, verificationToken, emailVerificationTtlSeconds).catch((error) => {
+    console.error("Failed to store email verification token in Redis:", error);
+    return false;
+  });
+
+  if (storedVerificationInRedis) {
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        verificationToken: null,
+        verificationExpiry: null,
+      },
+    });
+  }
+
   await sendVerificationEmail(user.email, rawToken, user.name).catch((error) => {
     console.error("Failed to send signup email:", error);
   });
@@ -462,7 +608,7 @@ export async function registerUser(input: RegisterInput, context?: AuthRequestCo
   };
 }
 
-export async function LoginUser(input: LoginInput & { type?: string }, context?: AuthRequestContext) {
+async function authenticateLoginInput(input: LoginInput & { type?: string }, context?: AuthRequestContext) {
   const parsed = parseOrThrow(loginSchema, input);
   const email = normalizeEmail(parsed.email);
   const user = await prisma.user.findUnique({ where: { email } });
@@ -504,10 +650,25 @@ export async function LoginUser(input: LoginInput & { type?: string }, context?:
     throw new Error(`This account does not have ${requestedRole?.toLowerCase()} access`);
   }
 
+  return { user, authUser, email };
+}
+
+export async function LoginUser(input: LoginInput & { type?: string }, context?: AuthRequestContext) {
+  const { user, authUser, email } = await authenticateLoginInput(input, context);
+
   await resetLoginState(user.id, context);
+  let refreshToken: string;
+  try {
+    refreshToken = await createRefreshAuth(user, context);
+  } catch (error) {
+    if (error instanceof DeviceLimitReachedError) {
+      await recordSecurityEvent(user.id, "DEVICE_LIMIT_REACHED", context, { deviceId: context?.deviceId });
+    }
+    throw error;
+  }
   await recordLoginAttempt(email, true, context);
   await recordSecurityEvent(user.id, "LOGIN_SUCCESS", context);
-  const refreshToken = await createRefreshAuth(user, context);
+  await recordSecurityEvent(user.id, "DEVICE_LOGIN", context, { deviceId: context?.deviceId });
 
   await sendAuthEmail({ to: user.email, name: user.name, type: "login" }).catch((error) => {
     console.error("Failed to send login email:", error);
@@ -515,6 +676,95 @@ export async function LoginUser(input: LoginInput & { type?: string }, context?:
 
   return {
     user: authUser,
+    token: createSessionToken(user),
+    refreshToken,
+  };
+}
+
+export async function listUserDevices(userId: string, currentDeviceId?: string) {
+  return listActiveDevicesForUser(userId, currentDeviceId);
+}
+
+export async function logoutUserDevice(userId: string, deviceId: string, context?: AuthRequestContext, eventType = "DEVICE_FORCE_LOGOUT") {
+  const device = await prisma.userDevice.findFirst({
+    where: { userId, deviceId, isActive: true },
+  });
+
+  if (!device) {
+    const error = new Error("Device not found or already logged out") as Error & { statusCode?: number };
+    error.statusCode = 404;
+    throw error;
+  }
+
+  await prisma.$transaction(async (tx) => {
+    if (device.refreshTokenHash) {
+      await tx.refreshToken.updateMany({
+        where: { tokenHash: device.refreshTokenHash, isRevoked: false },
+        data: { isRevoked: true, revokedAt: new Date() },
+      });
+    }
+
+    await tx.session.updateMany({
+      where: { userId, deviceId, isActive: true },
+      data: { isActive: false, lastSeenAt: new Date() },
+    });
+
+    await tx.userDevice.updateMany({
+      where: { userId, deviceId, isActive: true },
+      data: {
+        isActive: false,
+        isCurrent: false,
+        refreshTokenHash: null,
+        lastSeenAt: new Date(),
+      },
+    });
+  });
+
+  if (device.refreshTokenHash) {
+    await deleteRefreshToken(device.refreshTokenHash).catch((error) => {
+      console.error("Failed to delete refresh token from Redis:", error);
+    });
+  }
+  await deleteActiveDeviceSession(userId, deviceId).catch((error) => {
+    console.error("Failed to delete active device session from Redis:", error);
+  });
+  await recordSecurityEvent(userId, eventType, context, { deviceId });
+}
+
+export async function replaceLoginDevice(input: LoginInput & { type?: string; deviceToLogout?: string }, context?: AuthRequestContext) {
+  const parsed = parseOrThrow(replaceDeviceLoginSchema, input);
+  const { user, authUser, email } = await authenticateLoginInput(parsed, context);
+
+  if (parsed.deviceToLogout === context?.deviceId) {
+    const error = new Error("Cannot replace the current device") as Error & { statusCode?: number };
+    error.statusCode = 400;
+    throw error;
+  }
+
+  await logoutUserDevice(user.id, parsed.deviceToLogout, context, "DEVICE_REPLACED");
+
+  await resetLoginState(user.id, context);
+  const refreshToken = await createRefreshAuth(user, context);
+  await recordLoginAttempt(email, true, context);
+  await recordSecurityEvent(user.id, "LOGIN_SUCCESS", context);
+  await recordSecurityEvent(user.id, "DEVICE_LOGIN", context, { deviceId: context?.deviceId, replacedDeviceId: parsed.deviceToLogout });
+
+  await sendAuthEmail({ to: user.email, name: user.name, type: "login" }).catch((error) => {
+    console.error("Failed to send login email:", error);
+  });
+
+  return {
+    user: authUser,
+    token: createSessionToken(user),
+    refreshToken,
+  };
+}
+
+export async function createAuthSessionForUser(user: Pick<DbUser, "id" | "role" | "email" | "name">, context?: AuthRequestContext) {
+  const refreshToken = await createRefreshAuth(user, context);
+  await recordSecurityEvent(user.id, "DEVICE_LOGIN", context, { deviceId: context?.deviceId });
+
+  return {
     token: createSessionToken(user),
     refreshToken,
   };
@@ -585,18 +835,34 @@ export async function VerifyEmail(emailInput: string, token: string) {
   const email = normalizeEmail(emailInput);
   const user = await prisma.user.findUnique({ where: { email } });
 
-  if (!user?.verificationToken) {
+  if (!user) {
     throw new Error("Invalid verification link");
   }
 
   assertAccountCanVerify(user);
 
-  if (user.verificationExpiry && user.verificationExpiry.getTime() < Date.now()) {
-    throw new Error("Verification link has expired");
-  }
+  const tokenHash = hashToken(token);
+  const redisToken = await getEmailVerificationToken(email).catch((error) => {
+    console.error("Failed to read email verification token from Redis:", error);
+    return null;
+  });
 
-  if (hashToken(token) !== user.verificationToken) {
-    throw new Error("Invalid verification link");
+  if (redisToken) {
+    if (redisToken !== tokenHash) {
+      throw new Error("Invalid verification link");
+    }
+  } else {
+    if (!user.verificationToken) {
+      throw new Error("Invalid verification link");
+    }
+
+    if (user.verificationExpiry && user.verificationExpiry.getTime() < Date.now()) {
+      throw new Error("Verification link has expired");
+    }
+
+    if (tokenHash !== user.verificationToken) {
+      throw new Error("Invalid verification link");
+    }
   }
 
   const updatedUser = await prisma.user.update({
@@ -613,6 +879,9 @@ export async function VerifyEmail(emailInput: string, token: string) {
   await prisma.host.updateMany({
     where: { userId: user.id },
     data: { isVerified: true },
+  });
+  await deleteEmailVerificationToken(email).catch((error) => {
+    console.error("Failed to delete email verification token from Redis:", error);
   });
 
   return { user: await toAuthUser(updatedUser), message: "Email verified successfully" };
@@ -870,32 +1139,106 @@ export async function ResetPassword(emailInput: string, token: string, password?
   }
 
   invalidateUserSessions(user.id);
-  await prisma.refreshToken.updateMany({
-    where: { userId: user.id, isRevoked: false },
-    data: { isRevoked: true, revokedAt: new Date() },
+  const deletedRedisRefreshTokens = await deleteUserRefreshTokens(user.id).catch((error) => {
+    console.error("Failed to delete user refresh tokens from Redis:", error);
+    return false;
   });
+  if (!deletedRedisRefreshTokens) {
+    await prisma.refreshToken.updateMany({
+      where: { userId: user.id, isRevoked: false },
+      data: { isRevoked: true, revokedAt: new Date() },
+    });
+  }
   await prisma.session.updateMany({
     where: { userId: user.id, isActive: true },
     data: { isActive: false, lastSeenAt: new Date() },
+  });
+  await prisma.userDevice.updateMany({
+    where: { userId: user.id, isActive: true },
+    data: {
+      isActive: false,
+      isCurrent: false,
+      refreshTokenHash: null,
+      lastSeenAt: new Date(),
+    },
+  });
+  await deleteUserActiveDeviceSessions(user.id).catch((error) => {
+    console.error("Failed to delete user active device sessions from Redis:", error);
   });
   await recordSecurityEvent(user.id, "PASSWORD_RESET_COMPLETED");
 
   return { message: "Password reset successful" };
 }
 
-export async function revokeRefreshToken(rawToken?: string) {
+export async function revokeRefreshToken(rawToken?: string, context?: AuthRequestContext) {
   if (!rawToken) {
     return;
   }
 
-  await prisma.refreshToken.updateMany({
-    where: {
-      tokenHash: hashToken(rawToken),
-      isRevoked: false,
-    },
-    data: {
-      isRevoked: true,
-      revokedAt: new Date(),
-    },
+  const tokenHash = hashToken(rawToken);
+  const existing = await prisma.refreshToken.findUnique({
+    where: { tokenHash },
   });
+
+  if (existing?.userId && existing.deviceId) {
+    const existingDeviceId = existing.deviceId;
+    await prisma.$transaction(async (tx) => {
+      await tx.refreshToken.updateMany({
+        where: {
+          tokenHash,
+          isRevoked: false,
+        },
+        data: {
+          isRevoked: true,
+          revokedAt: new Date(),
+        },
+      });
+      await tx.session.updateMany({
+        where: {
+          userId: existing.userId,
+          deviceId: existingDeviceId,
+          isActive: true,
+        },
+        data: {
+          isActive: false,
+          lastSeenAt: new Date(),
+        },
+      });
+      await tx.userDevice.updateMany({
+        where: {
+          userId: existing.userId,
+          deviceId: existingDeviceId,
+          isActive: true,
+        },
+        data: {
+          isActive: false,
+          isCurrent: false,
+          refreshTokenHash: null,
+          lastSeenAt: new Date(),
+        },
+      });
+    });
+    await deleteActiveDeviceSession(existing.userId, existingDeviceId).catch((error) => {
+      console.error("Failed to delete active device session from Redis:", error);
+    });
+    await recordSecurityEvent(existing.userId, "DEVICE_LOGOUT", context, { deviceId: existingDeviceId });
+  }
+
+  const deletedFromRedis = await deleteRefreshToken(tokenHash).catch((error) => {
+    console.error("Failed to delete refresh token from Redis:", error);
+    return false;
+  });
+
+  if (!deletedFromRedis && !existing) {
+    await prisma.refreshToken.updateMany({
+      where: {
+        tokenHash,
+        isRevoked: false,
+      },
+      data: {
+        isRevoked: true,
+        revokedAt: new Date(),
+      },
+    });
+  }
 }
