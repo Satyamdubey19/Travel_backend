@@ -10,8 +10,11 @@ modules/auth/controllers/auth.controller.ts
 modules/auth/services/auth.service.ts
 modules/auth/types/auth.ts
 lib/auth.ts                            NextAuth config
+lib/rate-limit.ts                      Redis-backed rate limiter with memory fallback
+lib/redis.ts                           shared lazy Redis client
 lib/hash.ts                            secure random token + SHA-256 hash
 lib/mail.ts                            verification, login, reset emails
+services/redis.service.ts              Redis auth state helpers
 prisma/schema.prisma                   User, Host, UserProfile models
 ```
 
@@ -26,8 +29,10 @@ Custom auth
   -> email/password register and login
   -> bcrypt password hashing
   -> JWT session token stored in httpOnly cookie named token
-  -> hashed refresh token stored in httpOnly cookie named refreshToken
-  -> Session, RefreshToken, LoginAttempt, and SecurityEvent rows for auth state/audit
+  -> raw refresh token stored in httpOnly cookie named refreshToken
+  -> hashed refresh token metadata stored in Redis when REDIS_URL is configured
+  -> RefreshToken, Session, UserDevice, LoginAttempt, and SecurityEvent rows for auth state/audit
+  -> maximum 3 active devices per user
 
 NextAuth
   -> credentials provider support
@@ -60,13 +65,25 @@ JWT expiry: 7 days
 JWT secret priority: JWT_ACCESS_SECRET -> JWT_SECRET -> NEXTAUTH_SECRET
 ```
 
-Credential login also creates a raw refresh token for the browser and stores only its SHA-256 hash in `RefreshToken`.
+Credential login also creates a raw refresh token for the browser and stores only its SHA-256 hash server-side.
 
 ```text
 Cookie name: refreshToken
 Cookie options: httpOnly, sameSite=lax, path=/, maxAge=30 days
-Database fields: tokenHash, deviceId, deviceName, ipAddress, userAgent, isRevoked, expiresAt
-Logout and password reset revoke matching refresh-token rows.
+Redis key: gethotels:auth:refresh:<tokenHash>
+Redis user index: gethotels:auth:refresh:user:<userId>
+Stored metadata: userId, deviceId, deviceName, ipAddress, userAgent, createdAt
+TTL: 30 days
+Database row: RefreshToken.tokenHash, deviceId, deviceName, ipAddress, userAgent, isRevoked, expiresAt
+Logout and password reset delete matching Redis refresh-token keys and revoke database rows.
+```
+
+Device identity is tracked in an httpOnly `deviceId` cookie. The server chooses device id in this order:
+
+```text
+1. X-Device-Id header
+2. deviceId cookie
+3. generated UUID
 ```
 
 Because the cookie is `httpOnly`, frontend JavaScript cannot read the JWT directly. The frontend checks the session by calling `GET /api/auth/me`.
@@ -165,7 +182,8 @@ request body
   -> reject duplicate email
   -> bcrypt.hash(password, 12)
   -> generate raw verification token
-  -> store SHA-256 hashed verification token
+  -> store SHA-256 hashed verification token in Redis
+  -> fall back to User.verificationToken when Redis is not configured
   -> set verification expiry to 24 hours
   -> create User with role USER
   -> create pending Host profile if signup requested host
@@ -180,6 +198,7 @@ POST /api/auth/login
 ```
 
 Authenticates by email and password, requires an active and verified account, optionally checks a requested role, sends a login alert email, sets the `token` cookie, and sets a hashed-refresh-token backed `refreshToken` cookie.
+Login enforces a maximum of 3 active devices per user.
 
 Request:
 
@@ -217,6 +236,28 @@ This account does not have admin access
 Please verify your email before logging in
 Account is temporarily locked. Try again later.
 JWT secret is not configured
+DEVICE_LIMIT_REACHED
+```
+
+Device limit response `409`:
+
+```json
+{
+  "error": "DEVICE_LIMIT_REACHED",
+  "message": "Maximum device limit reached",
+  "devices": [
+    {
+      "id": "device-id",
+      "deviceId": "device-id",
+      "deviceName": "Chrome Windows",
+      "browser": "Chrome",
+      "os": "Windows",
+      "ipAddress": "127.0.0.1",
+      "lastSeenAt": "2026-06-14T10:00:00.000Z",
+      "isCurrent": false
+    }
+  ]
+}
 ```
 
 Internal flow:
@@ -233,12 +274,18 @@ normalize email
   -> build auth user with Host info
   -> check requested role if type is provided
   -> reset failedLoginAttempts and lockedUntil
+  -> resolve current device id/name/browser/os/ip/user-agent
+  -> if current device is active, update it and allow login
+  -> if fewer than 3 active devices exist, create UserDevice and Session
+  -> if 3 other active devices exist, return 409 and do not create token/session
   -> create LoginAttempt and SecurityEvent rows
   -> create Session row
-  -> create raw refresh token and store only tokenHash
+  -> create raw refresh token and store tokenHash metadata in Redis
+  -> store RefreshToken row
+  -> store Redis active-device key auth:device:{userId}:{deviceId}
   -> send login email
   -> create JWT
-  -> set httpOnly token and refreshToken cookies
+  -> set httpOnly token, refreshToken, and deviceId cookies
   -> return user
 ```
 
@@ -293,7 +340,85 @@ read cookie token
   -> return user or 401
 ```
 
-### 4. Update Current User / Become Host
+### 4. Device Sessions
+
+```text
+GET /api/auth/devices
+```
+
+Returns active devices for the current user.
+
+Success `200`:
+
+```json
+[
+  {
+    "id": "device-id",
+    "deviceId": "device-id",
+    "deviceName": "Chrome Windows",
+    "browser": "Chrome",
+    "os": "Windows",
+    "ipAddress": "127.0.0.1",
+    "lastSeenAt": "2026-06-14T10:00:00.000Z",
+    "isCurrent": true
+  }
+]
+```
+
+```text
+POST /api/auth/devices/logout
+```
+
+Logs out a selected active device that belongs to the current user.
+
+Request:
+
+```json
+{
+  "deviceId": "device-id"
+}
+```
+
+Internal flow:
+
+```text
+authenticate current user
+  -> verify selected device belongs to user and isActive=true
+  -> revoke matching RefreshToken row
+  -> delete Redis refresh-token and auth:device keys
+  -> deactivate Session rows for device
+  -> mark UserDevice inactive
+  -> record DEVICE_FORCE_LOGOUT
+```
+
+```text
+POST /api/auth/login/replace-device
+```
+
+Used after normal login returns `DEVICE_LIMIT_REACHED`.
+
+Request:
+
+```json
+{
+  "email": "rahul@example.com",
+  "password": "secret123",
+  "deviceToLogout": "device-id"
+}
+```
+
+Internal flow:
+
+```text
+validate credentials
+  -> verify deviceToLogout belongs to that user and is active
+  -> logout selected device
+  -> create current device session
+  -> issue token, refreshToken, and deviceId cookies
+  -> record DEVICE_REPLACED, DEVICE_LOGIN, and LOGIN_SUCCESS
+```
+
+### 5. Update Current User / Become Host
 
 ```text
 PATCH /api/auth/me
@@ -373,13 +498,14 @@ read NextAuth session user id
 
 When `activateHost` is true, the user role remains unchanged. A `Host` row is created or updated as a pending host profile. Admin/KYC approval must promote or enable host access separately.
 
-### 5. Logout
+### 6. Logout
 
 ```text
 POST /api/auth/logout
 ```
 
 Deletes the custom `token` cookie.
+It also deletes the matching Redis refresh-token entry, revokes the database `RefreshToken` row, deactivates `Session` rows for the current device, and marks the current `UserDevice` inactive.
 
 Success `200`:
 
@@ -391,7 +517,7 @@ Success `200`:
 
 Frontend also calls NextAuth `signOut({ redirect: false })` to clear any NextAuth session.
 
-### 6. Verify Email
+### 7. Verify Email
 
 ```text
 GET /api/auth/verify?email=user@example.com&token=raw-token
@@ -421,16 +547,17 @@ Internal flow:
 read email and token from query
   -> normalize email
   -> find User
-  -> require verificationToken
-  -> check verificationExpiry
-  -> SHA-256 hash query token and compare with stored hash
+  -> SHA-256 hash query token
+  -> compare with Redis verification token first
+  -> fall back to User.verificationToken and verificationExpiry for older links
   -> set isEmailVerified=true
   -> clear verificationToken and verificationExpiry
+  -> delete Redis verification token
   -> mark matching Host rows isVerified=true
   -> return user
 ```
 
-### 7. Forgot Password
+### 8. Forgot Password
 
 ```text
 POST /api/auth/forgot-password
@@ -467,7 +594,7 @@ normalize email
      NEXTAUTH_URL/reset-password?email=...&token=...
 ```
 
-### 8. Reset Password
+### 9. Reset Password
 
 ```text
 POST /api/auth/reset-password
@@ -510,25 +637,30 @@ normalize email
   -> bcrypt.hash(new password, 12)
   -> mark token used
   -> update password and clear legacy reset fields
-  -> revoke refresh tokens
+  -> delete all user refresh tokens from Redis
+  -> revoke RefreshToken rows
   -> deactivate sessions
+  -> mark all UserDevice rows inactive
   -> invalidate in-memory JWT sessions
 ```
 
-### 9. Google Login Bridge
+### 10. Google Login Bridge
 
 ```text
 GET /api/auth/google-login
 ```
 
 This route expects a valid NextAuth Google session. It creates or updates the matching DB user, creates the custom JWT cookie, then redirects to the app home URL.
+It also creates the same refresh-token and device session used by credential login, so the 3-device limit applies to Google login too.
 
 Success behavior:
 
 ```text
 valid NextAuth session
   -> handleGoogleAuth()
-  -> set custom token cookie
+  -> resolve current device
+  -> enforce max 3 active devices
+  -> set custom token, refreshToken, and deviceId cookies
   -> redirect to NEXTAUTH_URL or http://localhost:3000
 ```
 
@@ -537,6 +669,8 @@ Failure behavior:
 ```text
 missing Google session/email
   -> redirect to /login
+device limit reached
+  -> redirect to /login?error=DEVICE_LIMIT_REACHED
 ```
 
 The frontend starts this flow with:
@@ -545,7 +679,7 @@ The frontend starts this flow with:
 signIn("google", { callbackUrl: "/api/auth/google-login" })
 ```
 
-### 10. NextAuth Catch-All
+### 11. NextAuth Catch-All
 
 ```text
 GET  /api/auth/[...nextauth]
@@ -602,7 +736,7 @@ GET  /api/verify?token=...
 
 `/api/forgot-password` and `/api/reset-password` call the same controller as the `/api/auth/*` versions.
 
-`/api/verify` is legacy and should not be used for the current email verification flow. The current signup stores a hashed verification token and expects `/api/auth/verify?email=...&token=...`.
+`/api/verify` is legacy and should not be used for the current email verification flow. The current signup stores a hashed verification token in Redis when configured and expects `/api/auth/verify?email=...&token=...`.
 
 ## Frontend Auth Flow
 
@@ -718,14 +852,37 @@ isBanned
 ### Auth State And Audit Tables
 
 ```text
-RefreshToken       hashed refresh tokens; plaintext tokens are never stored
+RefreshToken       hashed refresh-token audit/fallback rows with device metadata
 Session            active browser/device sessions and last-seen metadata
 PasswordResetToken one-time hashed reset tokens with expiry and usedAt
 LoginAttempt       successful/failed login attempts by email and IP
-OtpVerification    hashed OTP store for register/login/reset/email/phone flows
+OtpVerification    database OTP model reserved for register/login/reset/email/phone flows
 UserDevice         known device IDs per user
 EmailChangeRequest pending verified email changes
 SecurityEvent      login, reset, lockout, and registration audit events
+```
+
+### Device Session Fields
+
+```text
+Session.deviceId
+Session.deviceName
+Session.deviceType
+Session.ipAddress
+Session.userAgent
+Session.lastSeenAt
+Session.isActive
+
+UserDevice.deviceId
+UserDevice.deviceName
+UserDevice.browser
+UserDevice.os
+UserDevice.ipAddress
+UserDevice.userAgent
+UserDevice.lastSeenAt
+UserDevice.isCurrent
+UserDevice.isActive
+UserDevice.refreshTokenHash
 ```
 
 ### Host
@@ -762,6 +919,7 @@ Passwords are hashed with bcrypt, 12 rounds.
 Verification and reset tokens are generated with crypto.randomBytes(32).
 Only hashed tokens are stored in the database.
 Session JWT is stored in an httpOnly cookie.
+Refresh token hashes and email verification token hashes are stored in Redis when REDIS_URL is configured.
 Credential login requires verified email.
 Password reset response does not reveal whether an email exists.
 Public signup blocks ADMIN creation.
@@ -769,7 +927,7 @@ Public host signup creates a pending Host profile, not HOST role.
 Host access requires role HOST and host authorization checks.
 Admin access requires role ADMIN.
 Auth mutation requests require a trusted Origin or Referer header.
-Auth endpoints have in-memory rate limiting.
+Auth endpoints use Redis-backed rate limiting when REDIS_URL is configured, with process-memory fallback for local development.
 ```
 
 ## Environment Variables
@@ -781,6 +939,7 @@ JWT_ACCESS_SECRET
 JWT_SECRET
 NEXTAUTH_SECRET
 NEXTAUTH_URL
+REDIS_URL
 GOOGLE_CLIENT_ID
 GOOGLE_CLIENT_SECRET
 RESEND_API_KEY
@@ -793,6 +952,14 @@ At least one JWT secret source must be configured:
 ```text
 JWT_ACCESS_SECRET or JWT_SECRET or NEXTAUTH_SECRET
 ```
+
+Redis is strongly recommended outside local development:
+
+```text
+REDIS_URL=redis://localhost:6379
+```
+
+Without Redis, rate limits fall back to process memory, email verification tokens fall back to `User.verificationToken`, and refresh token hashes fall back to `RefreshToken` rows where implemented.
 
 ## Common Issues
 

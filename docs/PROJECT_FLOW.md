@@ -27,6 +27,7 @@ npm run dev
 - Next.js App Router API route handlers.
 - TypeScript.
 - Prisma ORM with PostgreSQL.
+- Redis/ioredis for shared rate limiting and auth token state when `REDIS_URL` is configured.
 - NextAuth and custom auth endpoints.
 - bcrypt for password hashing.
 - jsonwebtoken for token support.
@@ -87,6 +88,7 @@ Required or commonly used variables:
 
 ```text
 DATABASE_URL
+REDIS_URL
 JWT_SECRET
 NEXTAUTH_URL
 NEXTAUTH_SECRET
@@ -139,6 +141,17 @@ KycApplication
 AuditLog
 ModerationLog
 ```
+
+Redis-backed auth state:
+
+```text
+gethotels:rate-limit:*             shared endpoint rate-limit counters
+gethotels:auth:email-verify:*      hashed email verification token by normalized email
+gethotels:auth:refresh:*           hashed refresh-token metadata
+gethotels:auth:refresh:user:*      per-user refresh-token hash index
+```
+
+Refresh-token hashes are also persisted in PostgreSQL for audit and fallback. Redis is used for fast shared auth state when configured.
 
 Roles:
 
@@ -223,9 +236,12 @@ TourWaitlist
 ```text
 POST /api/auth/register
 POST /api/auth/login
+POST /api/auth/login/replace-device
 POST /api/auth/logout
 GET  /api/auth/me
 PATCH /api/auth/me
+GET  /api/auth/devices
+POST /api/auth/devices/logout
 GET  /api/auth/verify
 POST /api/auth/forgot-password
 POST /api/auth/reset-password
@@ -362,9 +378,12 @@ POST /api/cron/expire-bookings
 POST /api/auth/register
   -> validate name/email/phone/password/role
   -> require trusted Origin/Referer
-  -> apply in-memory rate limit
+  -> apply Redis-backed rate limit by IP and email
   -> check duplicate user
   -> hash password
+  -> generate raw email verification token
+  -> store SHA-256 hashed verification token in Redis with 24 hour TTL
+  -> fall back to User.verificationToken fields if Redis is not configured
   -> create PENDING User with role USER
   -> create pending Host profile if host signup was requested
   -> send email verification link
@@ -377,6 +396,8 @@ POST /api/auth/register
 
 ```text
 POST /api/auth/login
+  -> require trusted Origin/Referer
+  -> apply Redis-backed rate limit by IP and email/IP
   -> find user by email
   -> run dummy bcrypt compare for missing users
   -> reject banned, inactive, deleted, or non-ACTIVE users
@@ -386,9 +407,71 @@ POST /api/auth/login
   -> record failed LoginAttempt and update lockout counters on bad password
   -> check requested role if provided
   -> reset lockout counters on success
-  -> create LoginAttempt, SecurityEvent, Session, and hashed RefreshToken rows
-  -> issue JWT token cookie and refreshToken cookie
+  -> resolve device from X-Device-Id, deviceId cookie, or generated UUID
+  -> if current device is already active, allow login and update lastSeenAt
+  -> if fewer than 3 active devices exist, create the device session
+  -> if 3 other active devices exist, return 409 DEVICE_LIMIT_REACHED with active device list and do not issue tokens
+  -> create LoginAttempt, SecurityEvent, and Session rows
+  -> generate access JWT and raw refresh token
+  -> store SHA-256 hashed refresh token metadata in Redis with 30 day TTL
+  -> store active device marker auth:device:{userId}:{deviceId} in Redis
+  -> store matching RefreshToken row with device metadata
+  -> issue httpOnly token, refreshToken, and deviceId cookies
   -> return user with role and host info
+```
+
+### Device Limit And Replacement
+
+```text
+Maximum active devices per user: 3
+
+GET /api/auth/devices
+  -> authenticate current user
+  -> return active UserDevice rows
+  -> mark current request device with isCurrent=true
+
+POST /api/auth/devices/logout
+  -> authenticate current user
+  -> validate selected device belongs to user and is active
+  -> revoke matching RefreshToken row
+  -> delete Redis refresh-token and active-device keys
+  -> deactivate Session rows for selected device
+  -> mark UserDevice inactive
+  -> record DEVICE_FORCE_LOGOUT
+
+POST /api/auth/login/replace-device
+  -> validate email/password like normal login
+  -> validate deviceToLogout belongs to the same user and is active
+  -> logout selected device
+  -> create session for current device
+  -> issue token, refreshToken, and deviceId cookies
+  -> record DEVICE_REPLACED and DEVICE_LOGIN
+```
+
+Device identification priority:
+
+```text
+1. X-Device-Id header
+2. deviceId cookie
+3. generated UUID stored in httpOnly deviceId cookie
+```
+
+Google OAuth bridge uses the same device/session creator. If the user already has 3 active devices and the Google login is from a new device, `/api/auth/google-login` redirects to `/login?error=DEVICE_LIMIT_REACHED` instead of issuing cookies.
+
+### Email Verification
+
+```text
+GET /api/auth/verify?email=...&token=...
+  -> apply Redis-backed rate limit by IP
+  -> normalize email
+  -> load user by email
+  -> hash submitted token
+  -> compare against Redis email verification token first
+  -> fall back to User.verificationToken fields for older links
+  -> mark user email verified and ACTIVE
+  -> delete Redis verification token
+  -> clear legacy verification fields
+  -> mark related Host row verified
 ```
 
 ### Current User
@@ -408,7 +491,11 @@ GET /api/auth/me
 POST /api/auth/logout
   -> require trusted Origin/Referer
   -> revoke current JWT in process memory
-  -> revoke current refresh token in database
+  -> delete current refresh token from Redis
+  -> delete Redis active-device key
+  -> mark current UserDevice inactive
+  -> deactivate Session rows for current device
+  -> revoke matching RefreshToken row
   -> clear token and refreshToken cookies
   -> return success
 ```
@@ -428,7 +515,8 @@ POST /api/auth/reset-password
   -> reject expired or used token
   -> mark token used atomically
   -> update password
-  -> revoke all refresh tokens
+  -> delete all user refresh tokens from Redis
+  -> revoke RefreshToken rows
   -> deactivate sessions
   -> invalidate current JWT sessions in process memory
 ```
@@ -922,14 +1010,15 @@ http://localhost:4000
 ## Production Flow
 
 1. Configure production `DATABASE_URL`.
-2. Configure auth secrets and OAuth credentials.
-3. Configure payment, email, storage, AI, and location provider credentials.
-4. Run Prisma migration deployment.
-5. Build backend.
-6. Start backend on configured port.
-7. Point frontend `BACKEND_API_URL` to the backend origin.
-8. Configure cron jobs for booking expiration and scheduled workers.
-9. Monitor logs for payment, booking, and email failures.
+2. Configure production `REDIS_URL` for shared rate limits, verification tokens, and refresh-token state.
+3. Configure auth secrets and OAuth credentials.
+4. Configure payment, email, storage, AI, and location provider credentials.
+5. Run Prisma migration deployment.
+6. Build backend.
+7. Start backend on configured port.
+8. Point frontend `BACKEND_API_URL` to the backend origin.
+9. Configure cron jobs for booking expiration and scheduled workers.
+10. Monitor logs for payment, booking, auth, Redis, and email failures.
 
 ## Security Rules
 
@@ -939,6 +1028,7 @@ http://localhost:4000
 - Verify payment signatures on backend only.
 - Validate booking ownership before returning or mutating booking data.
 - Enforce role checks for host and admin routes.
+- Keep `REDIS_URL` configured in production so rate limits and refresh-token state survive process restarts and work across instances.
 - Use transactions for inventory, payment confirmation, seat assignment, waitlist, and cancellation.
 - Store sensitive identity values as hashes where possible.
 
