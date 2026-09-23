@@ -1,8 +1,5 @@
 import { NextResponse, NextRequest } from "next/server";
-import { getServerSession } from "next-auth";
-import { cookies } from "next/headers";
-import { authOptions } from "@/lib/auth";
-import { getUserFromSessionToken } from "@/modules/auth/services/auth.service";
+import { currentUserId } from "@/utils/user-auth";
 import { WishlistTarget } from "@prisma/client";
 import {
   getWishlistService,
@@ -10,20 +7,9 @@ import {
   removeFromWishlistService,
 } from "@/modules/wishlist/services/wishlist.service";
 
-async function resolveUserId(): Promise<string | null> {
-  const session = await getServerSession(authOptions);
-  if (session?.user?.id) return String(session.user.id);
-
-  const token = (await cookies()).get("token")?.value;
-  if (!token) return null;
-
-  const user = await getUserFromSessionToken(token);
-  return user?.id ? String(user.id) : null;
-}
-
 export const getWishlistController = async () => {
   try {
-    const userId = await resolveUserId();
+    const userId = await currentUserId();
     if (!userId) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 });
     }
@@ -48,7 +34,7 @@ export const addToWishlistController = async (req: NextRequest) => {
     };
     console.log("Received add to wishlist request:", { body });
 
-    const userId = await resolveUserId();
+    const userId = await currentUserId();
     if (!userId) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 });
     }
@@ -80,7 +66,7 @@ export const removeFromWishlistController = async (req: NextRequest) => {
   try {
     const { id } = await req.json() as { id?: string };
 
-    const userId = await resolveUserId();
+    const userId = await currentUserId();
     if (!userId) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 });
     }

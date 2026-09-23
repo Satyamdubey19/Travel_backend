@@ -21,6 +21,16 @@ export type Tour = {
   womenOnly?: boolean;
   safeForSoloWomen?: boolean;
   verifiedTravelersOnly?: boolean;
+  riskLevel?: string;
+  riskDisclosure?: string;
+  meetingPoint?: string;
+  eligibilityRequirements?: string[];
+  requiredEquipment?: string[];
+  emergencyPlan?: string;
+  emergencyPlanRecorded?: boolean;
+  minimumAge?: number;
+  requiresCaretaker?: boolean;
+  languages?: string[];
   rating: number;
   reviews: number;
   image: string;

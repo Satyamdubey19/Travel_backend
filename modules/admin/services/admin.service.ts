@@ -1,7 +1,15 @@
 import { prisma } from "@/lib/prisma"
+import cloudinary from "@/lib/cloudinary"
+import { decryptSensitiveField, maskIdentityNumber } from "@/lib/field-encryption"
+import { assertAdminAccountStatusChange } from "@/modules/admin/services/admin-account-policy"
+import { assertPayoutTransition } from "@/modules/admin/services/payout-policy"
+import { resolveKycDecision } from "@/modules/host/services/kyc-policy"
 import type { BookingEventType, BookingStatus } from "@prisma/client"
 import type { AdminSession } from "@/utils/admin-auth"
 import type { ListQuery } from "@/utils/admin-query"
+import { queueNotification } from "@/modules/notification/services/notification-outbox.service"
+import { assertTourSafetyReady } from "@/modules/tour/services/tour-listing-policy"
+import { resolveHostAccountUpdate } from "@/modules/admin/services/host-account-policy"
 
 type EntityType = "USER" | "HOST" | "BOOKING" | "LISTING" | "KYC" | "PAYOUT"
 type ListingType = "tour" | "rental" | "activity"
@@ -32,6 +40,19 @@ function normalizeQuery(value: string) {
   return value.trim().toLowerCase()
 }
 
+function privateKycDocumentUrl(assetReference: string | null) {
+  if (!assetReference || assetReference.startsWith("http://") || assetReference.startsWith("https://")) return ""
+  const separator = assetReference.lastIndexOf(".")
+  if (separator < 1) return ""
+  const publicId = assetReference.slice(0, separator)
+  const format = assetReference.slice(separator + 1)
+  return cloudinary.utils.private_download_url(publicId, format, {
+    type: "authenticated",
+    expires_at: Math.floor(Date.now() / 1000) + 10 * 60,
+    attachment: false,
+  })
+}
+
 function toBookingEventType(status: BookingStatus): BookingEventType {
   if (status === "CONFIRMED") return "CONFIRMED"
   if (status === "CANCELLED") return "CANCELLED"
@@ -54,7 +75,7 @@ async function writeAuditLog(admin: AdminSession, action: string, entity: Entity
 }
 
 async function notifyUser(userId: string, title: string, message: string, type: "SYSTEM" | "KYC_APPROVED" | "KYC_REJECTED" | "HOST_APPROVED" | "HOST_REJECTED" | "BOOKING_CONFIRMED" | "BOOKING_CANCELLED" | "PAYOUT_PROCESSED" | "PAYOUT_FAILED", data?: unknown) {
-  await prisma.notification.create({
+  await prisma.$transaction((tx) => queueNotification(tx, {
     data: {
       userId,
       type,
@@ -62,7 +83,7 @@ async function notifyUser(userId: string, title: string, message: string, type: 
       message,
       data: data ? JSON.parse(JSON.stringify(data)) : undefined,
     },
-  })
+  }))
 }
 
 export async function getAdminDashboard() {
@@ -72,6 +93,7 @@ export async function getAdminDashboard() {
     pendingKYC,
     approvedKYC,
     rejectedKYC,
+    tourBookings,
     rentalBookings,
     activityBookings,
     pendingListings,
@@ -86,6 +108,7 @@ export async function getAdminDashboard() {
     prisma.kycApplication.count({ where: { status: "PENDING" } }),
     prisma.kycApplication.count({ where: { status: "APPROVED" } }),
     prisma.kycApplication.count({ where: { status: "REJECTED" } }),
+    prisma.booking.count({ where: { tourId: { not: null } } }),
     prisma.rentalBooking.count(),
     prisma.activityBooking.count(),
     Promise.all([
@@ -98,7 +121,19 @@ export async function getAdminDashboard() {
     prisma.booking.findMany({
       orderBy: { createdAt: "desc" },
       take: 6,
-      include: { User: true, Tour: true },
+      // Keep the dashboard projection explicit. The admin summary only needs
+      // these fields, and selecting the full legacy Booking row would make a
+      // harmless schema addition (for example riskAcknowledgedAt) take down
+      // the entire admin dashboard on an older development database.
+      select: {
+        id: true,
+        bookingCode: true,
+        status: true,
+        totalAmount: true,
+        createdAt: true,
+        User: { select: { name: true } },
+        Tour: { select: { title: true } },
+      },
     }),
     prisma.user.findMany({
       orderBy: { createdAt: "desc" },
@@ -120,7 +155,7 @@ export async function getAdminDashboard() {
     stats: {
       totalUsers,
       totalHosts,
-      totalBookings: rentalBookings + activityBookings,
+      totalBookings: tourBookings + rentalBookings + activityBookings,
       pendingKYC,
       approvedKYC,
       rejectedKYC,
@@ -313,10 +348,27 @@ export async function listAdminUsers(query: ListQuery) {
 export async function updateAdminUser(id: string, admin: AdminSession, input: { status: string; reason?: string }) {
   const before = await prisma.user.findUnique({ where: { id } })
   if (!before) throw new Error("User not found")
+  const activeAdminCount = before.role === "ADMIN" && before.status === "ACTIVE" && input.status !== "ACTIVE"
+    ? await prisma.user.count({ where: { role: "ADMIN", status: "ACTIVE" } })
+    : 2
+  assertAdminAccountStatusChange({
+    actorId: admin.id,
+    targetId: id,
+    targetRole: before.role,
+    currentStatus: before.status,
+    nextStatus: input.status as "ACTIVE" | "SUSPENDED" | "DELETED",
+    reason: input.reason,
+    activeAdminCount,
+  })
+
+  if (before.status === input.status) return before
 
   const user = await prisma.user.update({
     where: { id },
-    data: { status: input.status as "ACTIVE" | "SUSPENDED" | "DELETED" },
+    data: {
+      status: input.status as "ACTIVE" | "SUSPENDED" | "DELETED",
+      sessionInvalidatedAt: input.status === "ACTIVE" ? undefined : new Date(),
+    },
   })
 
   await writeAuditLog(admin, `USER_${input.status}`, "USER", id, before, { status: input.status, reason: input.reason })
@@ -368,15 +420,23 @@ export async function updateAdminHost(id: string, admin: AdminSession, input: { 
   const before = await prisma.host.findUnique({ where: { id }, include: { User: true } })
   if (!before) throw new Error("Host not found")
 
-  const isActive = input.status === "ACTIVE"
-  const host = await prisma.host.update({
-    where: { id },
-    data: { isActive },
-  })
+  const transition = resolveHostAccountUpdate(input.status, before, before.User.role)
+  const host = await prisma.$transaction(async (tx) => {
+    const updatedHost = await tx.host.update({
+      where: { id },
+      data: { isActive: transition.hostIsActive },
+    })
 
-  await prisma.user.update({
-    where: { id: before.userId },
-    data: { status: input.status as "ACTIVE" | "SUSPENDED" | "DELETED" },
+    await tx.user.update({
+      where: { id: before.userId },
+      data: {
+        status: transition.userStatus,
+        sessionInvalidatedAt: transition.invalidateSession ? new Date() : undefined,
+        role: transition.userRole,
+      },
+    })
+
+    return updatedHost
   })
   await writeAuditLog(admin, `HOST_${input.status}`, "HOST", id, before, { status: input.status, reason: input.reason })
   await notifyUser(before.userId, "Host account updated", `Your host account status is now ${input.status.toLowerCase()}.`, "SYSTEM", { reason: input.reason })
@@ -400,7 +460,7 @@ export async function listAdminPayouts(query: ListQuery) {
       hostName: payout.Host.businessName ?? payout.Host.User.name,
       amount: money(payout.amount),
       bankName: payout.bankName ?? payout.Host.bankName ?? "Bank",
-      accountNumber: payout.accountNumber ?? payout.Host.bankAccountNumber ?? "0000",
+      accountNumber: (payout.accountNumber ?? payout.Host.bankAccountNumber ?? "").slice(-4),
       status: payout.status.toLowerCase(),
       transactionId: payout.transactionId ?? undefined,
       requestedAt: payout.requestedAt.toISOString(),
@@ -414,11 +474,14 @@ export async function listAdminPayouts(query: ListQuery) {
 export async function updateAdminPayout(id: string, admin: AdminSession, input: { status: string; transactionId?: string; failureReason?: string; notes?: string }) {
   const before = await prisma.payout.findUnique({ where: { id }, include: { Host: true } })
   if (!before) throw new Error("Payout not found")
+  const nextStatus = input.status as "PENDING" | "PROCESSING" | "COMPLETED" | "FAILED"
+  assertPayoutTransition({ currentStatus: before.status, nextStatus, transactionId: input.transactionId, failureReason: input.failureReason })
+  if (before.status === nextStatus) return before
 
   const payout = await prisma.payout.update({
     where: { id },
     data: {
-      status: input.status as "PENDING" | "PROCESSING" | "COMPLETED" | "FAILED",
+      status: nextStatus,
       transactionId: input.transactionId,
       failureReason: input.failureReason,
       notes: input.notes,
@@ -433,7 +496,7 @@ export async function updateAdminPayout(id: string, admin: AdminSession, input: 
   return payout
 }
 
-export async function listAdminKyc(query: ListQuery) {
+export async function listAdminKyc(query: ListQuery, hasStepUp = false) {
   const applications = await prisma.kycApplication.findMany({
     orderBy: { submittedAt: "desc" },
     include: { Host: { include: { User: true } } },
@@ -451,11 +514,13 @@ export async function listAdminKyc(query: ListQuery) {
       dateOfBirth: application.dateOfBirth?.toISOString() ?? "",
       nationality: application.nationality ?? "",
       idType: application.idType,
-      idNumber: application.idNumber,
-      idFrontImage: application.idFrontUrl ?? "",
-      idBackImage: application.idBackUrl ?? "",
-      addressProof: application.addressProofUrl ?? "",
-      businessLicense: application.businessDocUrl ?? "",
+      idNumber: maskIdentityNumber(decryptSensitiveField(application.idNumber)),
+      idFrontImage: hasStepUp ? privateKycDocumentUrl(application.idFrontUrl) : "",
+      idBackImage: hasStepUp ? privateKycDocumentUrl(application.idBackUrl) : "",
+      addressProof: hasStepUp ? privateKycDocumentUrl(application.addressProofUrl) : "",
+      businessLicense: hasStepUp ? privateKycDocumentUrl(application.businessDocUrl) : "",
+      isDocumentLocked: !hasStepUp,
+      requiresStepUp: !hasStepUp,
       taxCertificate: "",
       submittedAt: application.submittedAt.toISOString(),
       rejectionReason: application.rejectionReason ?? undefined,
@@ -472,32 +537,51 @@ export async function listAdminKyc(query: ListQuery) {
   }
 }
 
-export async function decideAdminKyc(id: string, admin: AdminSession, input: { action?: string; status?: string; rejectionReason?: string }) {
+export async function decideAdminKyc(id: string, admin: AdminSession, input: { action?: string; rejectionReason?: string }) {
   const before = await prisma.kycApplication.findUnique({ where: { id }, include: { Host: true } })
-  if (!before) throw new Error("KYC application not found")
+  if (!before) throw Object.assign(new Error("KYC application not found"), { statusCode: 404 })
+  if (before.status !== "PENDING") throw Object.assign(new Error("Only a pending KYC application can be decided"), { statusCode: 409 })
 
-  const nextStatus = input.status ?? (input.action === "approve" ? "APPROVED" : "REJECTED")
-  const application = await prisma.kycApplication.update({
-    where: { id },
-    data: {
-      status: nextStatus as "PENDING" | "APPROVED" | "REJECTED" | "NOT_SUBMITTED",
-      rejectionReason: nextStatus === "REJECTED" ? input.rejectionReason : null,
-      reviewedById: admin.id,
-      reviewedAt: new Date(),
-    },
+  const decision = resolveKycDecision(input)
+  const reviewedAt = new Date()
+  const application = await prisma.$transaction(async (tx) => {
+    const claimed = await tx.kycApplication.updateMany({
+      where: { id, status: "PENDING" },
+      data: {
+        status: decision.status,
+        rejectionReason: decision.rejectionReason,
+        reviewedById: admin.id,
+        reviewedAt,
+        resubmissionAllowed: decision.resubmissionAllowed,
+        resubmissionDeadline: decision.resubmissionAllowed ? new Date(reviewedAt.getTime() + 30 * 24 * 60 * 60 * 1000) : null,
+      },
+    })
+    if (claimed.count !== 1) throw Object.assign(new Error("This KYC application was already reviewed"), { statusCode: 409 })
+
+    await tx.host.update({
+      where: { id: before.hostId },
+      data: {
+        kycStatus: decision.status,
+        isVerified: decision.status === "APPROVED",
+        isApproved: decision.status === "APPROVED",
+        reviewedAt,
+        reviewedById: admin.id,
+        rejectionReason: decision.rejectionReason,
+      },
+    })
+    await tx.user.update({
+      where: { id: before.Host.userId },
+      data: {
+        role: decision.status === "APPROVED" ? "HOST" : "USER",
+        status: "ACTIVE",
+        sessionInvalidatedAt: reviewedAt,
+      },
+    })
+    return tx.kycApplication.findUniqueOrThrow({ where: { id } })
   })
 
-  await prisma.host.update({
-    where: { id: before.hostId },
-    data: {
-      kycStatus: nextStatus as "PENDING" | "APPROVED" | "REJECTED" | "NOT_SUBMITTED",
-      isVerified: nextStatus === "APPROVED",
-      isApproved: nextStatus === "APPROVED",
-    },
-  })
-
-  await writeAuditLog(admin, `KYC_${nextStatus}`, "KYC", id, before, input)
-  await notifyUser(before.Host.userId, nextStatus === "APPROVED" ? "KYC approved" : "KYC rejected", nextStatus === "APPROVED" ? "Your KYC documents were approved." : `Your KYC was rejected. ${input.rejectionReason ?? ""}`, nextStatus === "APPROVED" ? "KYC_APPROVED" : "KYC_REJECTED", input)
+  await writeAuditLog(admin, `KYC_${decision.status}`, "KYC", id, before, { action: input.action, rejectionReason: decision.rejectionReason })
+  await notifyUser(before.Host.userId, decision.status === "APPROVED" ? "KYC approved" : "KYC needs attention", decision.status === "APPROVED" ? "Your KYC documents were approved. Sign in again to open your host workspace." : `Your KYC was not approved. ${decision.rejectionReason}`, decision.status === "APPROVED" ? "KYC_APPROVED" : "KYC_REJECTED", { kycId: id, resubmissionAllowed: decision.resubmissionAllowed })
 
   return application
 }
@@ -528,6 +612,14 @@ export async function listAdminListings(query: ListQuery) {
       inventoryDetails: [{ label: "Tour slots", available: item.availableSlots, total: item.totalSlots }],
       bookings: item._count.Booking,
       reviews: item._count.Review,
+      riskLevel: item.riskLevel,
+      riskDisclosure: item.riskDisclosure,
+      meetingPoint: item.meetingPoint,
+      eligibilityRequirements: item.eligibilityRequirements,
+      requiredEquipment: item.requiredEquipment,
+      emergencyPlan: item.emergencyPlan,
+      minimumAge: item.minimumAge,
+      requiresCaretaker: item.requiresCaretaker,
       createdAt: item.createdAt.toISOString(),
     })),
     ...rentals.map((item) => ({
@@ -628,7 +720,7 @@ export async function updateAdminListing(type: ListingType, id: string, admin: A
   const reviewedAt = input.status ? new Date() : undefined
   const sharedData = {
     status: nextStatus,
-    isActive: input.isActive,
+    isActive: input.status ? nextStatus === "ACTIVE" : input.isActive,
     title: input.title,
     reviewedAt,
     reviewedById: input.status ? admin.id : undefined,
@@ -645,6 +737,7 @@ export async function updateAdminListing(type: ListingType, id: string, admin: A
   if (type === "tour") {
     const before = await prisma.tour.findUnique({ where: { id } })
     if (!before) throw new Error("Listing not found")
+    if (input.status === "ACTIVE") assertTourSafetyReady(before, { forApproval: true })
     const listing = await prisma.tour.update({ where: { id }, data: approvalData })
     await writeAuditLog(admin, `LISTING_${input.status ?? "UPDATED"}`, "LISTING", id, before, { ...input, type })
     return listing

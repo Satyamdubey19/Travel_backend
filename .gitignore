@@ -23,6 +23,7 @@
 *.log
 logs/
 uploads/
+scratch/
 
 # misc
 .DS_Store

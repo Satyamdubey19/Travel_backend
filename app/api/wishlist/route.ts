@@ -1,4 +1,4 @@
-import { NextRequest ,NextResponse} from "next/server";
+import { NextRequest } from "next/server";
 import { getWishlistController, addToWishlistController,removeFromWishlistController } from "@/modules/wishlist/controllers/wishlist.controller";
 
 export async function GET(req: NextRequest) {

@@ -4,6 +4,8 @@
 
 The admin module manages platform operations: dashboard metrics, users, hosts, KYC, listings, bookings, payouts, and posts.
 
+It also owns the activity/rental refund review queue. Admins may approve an exact amount no greater than the captured request, reject with a required reason, execute an approved refund through Razorpay, and reconcile delayed provider status. Decisions and provider outcomes are audit logged; completed/rejected decisions notify the traveler. Provider execution is never triggered by listing policy text alone.
+
 ## Source Files
 
 ```text

@@ -1,7 +1,5 @@
 import { NextRequest, NextResponse } from "next/server"
-import { getServerSession } from "next-auth"
-import { authOptions } from "@/lib/auth"
-import { getHostByUserId } from "@/modules/host/services/host.service"
+import { requireHost } from "@/utils/host-auth"
 import {
   listActivities,
   listPublicActivities,
@@ -14,13 +12,8 @@ import {
 } from "@/modules/activity/services/activity.service"
 
 async function getCurrentHost() {
-  const session = await getServerSession(authOptions)
-  if (!session?.user?.id) return { error: NextResponse.json({ error: "Unauthorized" }, { status: 401 }) }
-
-  const host = await getHostByUserId(session.user.id)
-  if (!host) return { error: NextResponse.json({ error: "Not a host" }, { status: 403 }) }
-
-  return { host }
+  try { return { host: (await requireHost()).host } }
+  catch (error) { return { error: NextResponse.json({ error: error instanceof Error ? error.message : "Unauthorized" }, { status: typeof error === "object" && error && "statusCode" in error ? Number((error as { statusCode: number }).statusCode) : 401 }) } }
 }
 
 export const getActivities = async (req: NextRequest) => {
@@ -78,7 +71,8 @@ export const createActivityController = async (req: NextRequest) => {
     console.error("POST /api/activity:", error)
     if ((error as { code?: string }).code === "P2002")
       return NextResponse.json({ error: "An activity with this slug already exists." }, { status: 409 })
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 })
+    const status = typeof error === "object" && error && "statusCode" in error ? Number((error as { statusCode?: number }).statusCode) || 500 : 500
+    return NextResponse.json({ error: error instanceof Error && status < 500 ? error.message : "Internal server error" }, { status })
   }
 }
 
@@ -96,7 +90,8 @@ export const updateActivityController = async (req: NextRequest, id: string) => 
     console.error("PUT /api/activity/[id]:", error)
     if ((error as { code?: string }).code === "P2002")
       return NextResponse.json({ error: "An activity with this slug already exists." }, { status: 409 })
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 })
+    const status = typeof error === "object" && error && "statusCode" in error ? Number((error as { statusCode?: number }).statusCode) || 500 : 500
+    return NextResponse.json({ error: error instanceof Error && status < 500 ? error.message : "Internal server error" }, { status })
   }
 }
 

@@ -22,10 +22,10 @@ Important note: `src/modules/auth/*` exists but is currently empty. The active a
 
 ## Auth Concepts
 
-The app supports two auth systems working together:
+The application has one authoritative application session:
 
 ```text
-Custom auth
+First-party auth
   -> email/password register and login
   -> bcrypt password hashing
   -> JWT session token stored in httpOnly cookie named token
@@ -34,14 +34,13 @@ Custom auth
   -> RefreshToken, Session, UserDevice, LoginAttempt, and SecurityEvent rows for auth state/audit
   -> maximum 3 active devices per user
 
-NextAuth
-  -> credentials provider support
-  -> Google OAuth support
-  -> JWT session strategy
-  -> session is also checked by /api/auth/me
+Google OAuth handoff
+  -> NextAuth is used only for Google's OAuth callback exchange
+  -> /api/auth/google-login converts the verified Google identity into the same first-party session
+  -> the short-lived NextAuth handoff cookie is cleared immediately after conversion
 ```
 
-The custom session cookie is preferred by most app code. If it is missing or invalid, `/api/auth/me` falls back to NextAuth session data.
+Credential, host, admin, device and current-user routes accept only the first-party session. A stale OAuth handoff cookie cannot authorize application data or role access.
 
 ## Cookie And Token Rules
 
@@ -59,9 +58,9 @@ Token details:
 
 ```text
 Cookie name: token
-Cookie options: httpOnly, sameSite=lax, path=/, maxAge=7 days
+Cookie options: httpOnly, sameSite=lax, path=/, maxAge=15 minutes
 Secure flag: true only in production
-JWT expiry: 7 days
+JWT expiry: 15 minutes
 JWT secret priority: JWT_ACCESS_SECRET -> JWT_SECRET -> NEXTAUTH_SECRET
 ```
 
@@ -167,7 +166,7 @@ Validation and errors:
 ```text
 Name is required
 Valid email is required
-Password must be at least 6 characters
+Password must be at least 12 characters
 Business name is required for host signup
 Email already exists
 Admin accounts cannot be created from signup
@@ -197,7 +196,7 @@ request body
 POST /api/auth/login
 ```
 
-Authenticates by email and password, requires an active and verified account, optionally checks a requested role, sends a login alert email, sets the `token` cookie, and sets a hashed-refresh-token backed `refreshToken` cookie.
+Authenticates by email and password, requires an active and verified account, sends a login alert email, sets the `token` cookie, and sets a hashed-refresh-token backed `refreshToken` cookie.
 Login enforces a maximum of 3 active devices per user.
 
 Request:
@@ -206,16 +205,6 @@ Request:
 {
   "email": "rahul@example.com",
   "password": "secret123"
-}
-```
-
-Request with role check:
-
-```json
-{
-  "email": "host@example.com",
-  "password": "secret123",
-  "type": "HOST"
 }
 ```
 
@@ -266,13 +255,10 @@ Internal flow:
 normalize email
   -> find User by email
   -> require password field
-  -> reject inactive, banned, deleted, or non-ACTIVE users
-  -> reject active lockouts
-  -> reject unverified email
   -> bcrypt.compare(password, stored hash)
-  -> record failed attempt and apply lockout thresholds on bad password
-  -> build auth user with Host info
-  -> check requested role if type is provided
+  -> for an unknown account or wrong password, return the same generic credential error and record a failed attempt
+  -> only after a correct password, reject inactive, banned, deleted, or non-ACTIVE users, active lockouts, or unverified email with the relevant recovery guidance
+  -> build a server-derived auth user with Host approval information
   -> reset failedLoginAttempts and lockedUntil
   -> resolve current device id/name/browser/os/ip/user-agent
   -> if current device is active, update it and allow login
@@ -289,13 +275,7 @@ normalize email
   -> return user
 ```
 
-Role check behavior:
-
-```text
-type=HOST  -> user must have host capability
-type=USER  -> any non-admin account is allowed
-type=ADMIN -> user role must be ADMIN
-```
+There is no public login role parameter. The returned database-derived role routes the user to traveler, approved-host or admin workspaces; every protected backend route repeats its own authorization check.
 
 ### 3. Current User
 
@@ -305,12 +285,7 @@ GET /api/auth/me
 
 Returns the current authenticated user.
 
-Auth source order:
-
-```text
-1. Custom token cookie
-2. NextAuth session
-```
+Auth source: the first-party `token` cookie only.
 
 Success `200`:
 
@@ -333,11 +308,9 @@ Internal flow:
 ```text
 read cookie token
   -> verify JWT
-  -> load User by token id
+  -> load current User and Host state by token id
   -> return sanitized user
-  -> if cookie fails, read NextAuth server session
-  -> load DB user by session user id when possible
-  -> return user or 401
+  -> otherwise return 401
 ```
 
 ### 4. Device Sessions
@@ -424,14 +397,13 @@ validate credentials
 PATCH /api/auth/me
 ```
 
-Updates the authenticated user's profile fields. It can also create or update a pending host profile by sending `activateHost: true`, but it does not grant `HOST` role.
+Updates the authenticated user's profile fields. It can also create or update a pending host profile by sending `activateHost: true`, but it does not grant `HOST` role. This endpoint never changes an account email. A different email is rejected and must use the verified email-change flow below.
 
 Request:
 
 ```json
 {
   "name": "Rahul Sharma",
-  "email": "rahul@example.com",
   "phone": "9999999999",
   "location": "Jaipur",
   "bio": "Frequent traveler",
@@ -458,7 +430,6 @@ Become host request:
 ```json
 {
   "name": "Rahul Sharma",
-  "email": "rahul@example.com",
   "phone": "9999999999",
   "businessName": "Rahul Travels",
   "activateHost": true
@@ -479,20 +450,19 @@ Errors:
 Unauthorized
 Invalid session user
 User not found
-Email is already in use
+Confirm a new email through the secure email-change flow
 ```
 
 Internal flow:
 
 ```text
-read NextAuth session user id
-  -> fallback to custom token cookie
+read first-party session user id
   -> validate user exists
-  -> normalize and check email uniqueness
-  -> update User name/email/phone
+  -> reject a direct email change
+  -> update User name/phone
   -> if activateHost=true, upsert Host profile
   -> upsert UserProfile with profile/preferences data
-  -> if host intent was submitted, refresh token cookie and delete NextAuth session cookie
+  -> if host intent was submitted, issue a fresh first-party access token
   -> return sanitized user
 ```
 
@@ -515,7 +485,7 @@ Success `200`:
 }
 ```
 
-Frontend also calls NextAuth `signOut({ redirect: false })` to clear any NextAuth session.
+The frontend also calls `signOut({ redirect: false })` as harmless cleanup if an interrupted Google handoff remains in the browser.
 
 ### 7. Verify Email
 
@@ -644,19 +614,70 @@ normalize email
   -> invalidate in-memory JWT sessions
 ```
 
-### 10. Google Login Bridge
+### 10. Sensitive Account Changes
+
+#### Request an email change
+
+```text
+POST /api/auth/email-change/request
+```
+
+This authenticated, same-site request requires the proposed email address and the account's current password. It creates one hashed, one-hour request at a time, emails the confirmation link to the **new** address, and sends a security notice to the old address. A new request replaces an earlier unused request.
+
+```json
+{
+  "email": "new-address@example.com",
+  "password": "current-password"
+}
+```
+
+The request returns `202`. It does not change the login email until confirmation. Credential accounts with an incorrect password receive `401`; Google/passwordless accounts are directed to change credentials through their sign-in provider.
+
+#### Confirm an email change
+
+```text
+POST /api/auth/email-change/confirm
+```
+
+The browser confirmation screen sends the `requestId` and raw token from the email link only after the visitor chooses to continue. This prevents mail scanners or link previews from changing an email on a GET request.
+
+```json
+{
+  "requestId": "uuid-from-link",
+  "token": "raw-token-from-link"
+}
+```
+
+The token is hashed before lookup, may be used once, and expires after one hour. On success, the user email and host contact email are updated atomically and all browser sessions, refresh tokens and active devices are invalidated. The user must sign in again.
+
+#### Change a password while signed in
+
+```text
+POST /api/auth/change-password
+```
+
+```json
+{
+  "currentPassword": "current-password",
+  "newPassword": "a-new-password-with-at-least-12-characters"
+}
+```
+
+The request is authenticated and same-site, requires a valid current password, rejects reusing the current password, and revokes all sessions/devices before returning success. The response intentionally requires a fresh sign-in.
+
+### 11. Google Login Bridge
 
 ```text
 GET /api/auth/google-login
 ```
 
-This route expects a valid NextAuth Google session. It creates or updates the matching DB user, creates the custom JWT cookie, then redirects to the app home URL.
+This route expects a valid temporary NextAuth Google session. It creates or updates the matching DB user, creates the first-party JWT cookie, clears the temporary OAuth handoff cookie, then redirects to a validated relative in-app path.
 It also creates the same refresh-token and device session used by credential login, so the 3-device limit applies to Google login too.
 
 Success behavior:
 
 ```text
-valid NextAuth session
+valid temporary Google session
   -> handleGoogleAuth()
   -> resolve current device
   -> enforce max 3 active devices
@@ -679,49 +700,36 @@ The frontend starts this flow with:
 signIn("google", { callbackUrl: "/api/auth/google-login" })
 ```
 
-### 11. NextAuth Catch-All
+### 12. NextAuth Catch-All
 
 ```text
 GET  /api/auth/[...nextauth]
 POST /api/auth/[...nextauth]
 ```
 
-Handled by `NextAuth(authOptions)`.
+Handled by `NextAuth(authOptions)` only for the Google provider callback exchange.
 
-Configured providers:
-
-```text
-Credentials
-Google
-```
+Configured provider: Google. Email/password authentication is handled solely by `POST /api/auth/login`.
 
 Session config:
 
 ```text
 strategy: jwt
-maxAge: 7 days
+maxAge: 5 minutes
 signIn page: /login
-```
-
-Credentials provider calls the same auth service:
-
-```text
-authorizeCredentials()
-  -> LoginUser()
-  -> bcrypt password check
-  -> role check
-  -> return sanitized user to NextAuth
 ```
 
 Google provider calls:
 
 ```text
-handleGoogleAuth()
-  -> require Google profile email_verified=true
+validate Google profile email_verified=true
+  -> create a 5-minute OAuth handoff session only
+  -> /api/auth/google-login calls handleGoogleAuth() exactly once
   -> create User if missing
   -> update provider/providerId when needed
   -> set isEmailVerified=true
   -> send signup/login email
+  -> create the first-party browser session
 ```
 
 ## Legacy Alias Routes
@@ -761,23 +769,19 @@ withCredentials: true
 
 ```text
 app loads
-  -> AuthContext reads localStorage.user
-  -> temporary user is shown if present
   -> GET /api/auth/me
-  -> backend user replaces local user
-  -> if backend unavailable and local user exists, keep local user
-  -> if no local user and API fails, user=null
+  -> backend supplies the only accepted user state
+  -> an unavailable or unauthorized API yields user=null
 ```
 
 ### Frontend Login
 
 ```text
 LoginForm
-  -> login(email, password, expectedRole?)
+  -> login(email, password)
   -> POST /api/auth/login
   -> backend sets httpOnly token cookie
   -> response user is normalized
-  -> localStorage.user is updated
   -> redirect:
        ADMIN -> /admin
        HOST  -> /host
@@ -807,17 +811,9 @@ HostSignupForm for logged-in user
 
 ```text
 logout()
-  -> remove localStorage.user
+  -> clear in-memory user state
   -> POST /api/auth/logout
   -> next-auth signOut({ redirect: false })
-```
-
-Development fallback:
-
-```text
-AuthContext contains browser localStorage fallback accounts.
-This is only a local/demo fallback when the API is unavailable.
-It must not be treated as secure production authentication.
 ```
 
 ## Database Fields Used
@@ -942,9 +938,8 @@ NEXTAUTH_URL
 REDIS_URL
 GOOGLE_CLIENT_ID
 GOOGLE_CLIENT_SECRET
-RESEND_API_KEY
-RESEND_FROM_EMAIL
-EMAIL_FROM
+BREVO_API_KEY
+BREVO_FROM_EMAIL
 ```
 
 At least one JWT secret source must be configured:
@@ -959,7 +954,7 @@ Redis is strongly recommended outside local development:
 REDIS_URL=redis://localhost:6379
 ```
 
-Without Redis, rate limits fall back to process memory, email verification tokens fall back to `User.verificationToken`, and refresh token hashes fall back to `RefreshToken` rows where implemented.
+Without Redis, rate limits fall back to process memory, email verification tokens fall back to `User.verificationToken`, and refresh token hashes fall back to `RefreshToken` rows where implemented. Verification and password-reset delivery never have a silent fallback: if the mail provider cannot accept the message, the request returns a safe service-unavailable response and no unusable account or reset token remains.
 
 ## Common Issues
 
@@ -971,7 +966,7 @@ Possible causes:
 No token cookie
 Expired or invalid JWT
 JWT secret changed after login
-NextAuth session also missing
+The first-party session has been revoked, expired or was never issued
 ```
 
 Fix:
@@ -1003,7 +998,7 @@ Possible causes:
 ```text
 User role is USER and no Host profile exists.
 Host profile exists but account has not been approved/promoted to HOST.
-User tried type=HOST on a normal user account.
+The host has not completed verification and approval.
 ```
 
 Fix:

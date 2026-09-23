@@ -1,7 +1,5 @@
-import { cookies } from "next/headers"
-import { getServerSession } from "next-auth"
-import { authOptions } from "@/lib/auth"
-import { getAuthUserById, getUserFromSessionToken } from "@/modules/auth/services/auth.service"
+import { cookies, headers } from "next/headers"
+import { getUserFromSessionToken } from "@/modules/auth/services/auth.service"
 
 export type AdminSession = {
   id: string
@@ -10,24 +8,33 @@ export type AdminSession = {
   role: "ADMIN"
 }
 
-export async function requireAdmin(request?: unknown): Promise<AdminSession> {
-  void request
-  const token = (await cookies()).get("token")?.value
-  if (token) {
-    const user = await getUserFromSessionToken(token)
-    if (user?.role === "ADMIN") {
-      return {
-        id: String(user.id),
-        email: user.email,
-        name: user.name,
-        role: "ADMIN",
-      }
+async function extractToken(request?: unknown): Promise<string | undefined> {
+  const cookieStore = await cookies()
+  const cookieToken = cookieStore.get("access_token")?.value || cookieStore.get("token")?.value
+  if (cookieToken) return cookieToken
+
+  if (request && typeof request === "object" && "headers" in request && typeof (request as { headers: Headers }).headers?.get === "function") {
+    const authHeader = (request as { headers: Headers }).headers.get("authorization")
+    if (authHeader) {
+      return authHeader.replace(/^Bearer\s+/i, "").trim() || undefined
     }
   }
 
-  const session = await getServerSession(authOptions)
-  if (session?.user?.id) {
-    const user = await getAuthUserById(session.user.id)
+  try {
+    const headerStore = await headers()
+    const authHeader = headerStore.get("authorization")
+    if (authHeader) {
+      return authHeader.replace(/^Bearer\s+/i, "").trim() || undefined
+    }
+  } catch {}
+
+  return undefined
+}
+
+export async function requireAdmin(request?: unknown): Promise<AdminSession> {
+  const token = await extractToken(request)
+  if (token) {
+    const user = await getUserFromSessionToken(token)
     if (user?.role === "ADMIN") {
       return {
         id: String(user.id),

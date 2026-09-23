@@ -2,80 +2,67 @@
 
 ## Purpose
 
-Jobs and cron modules handle delayed or background operations such as booking expiry, refunds, waitlist processing, payouts, contests, and emails.
+Jobs perform delayed or external work without making critical booking and payment transactions depend on network providers. Two cron entry points are currently active: stale booking expiry and durable notification email delivery.
 
-## Source Files
-
-```text
-app/api/cron/expire-bookings/route.ts
-src/jobs/queues/*
-src/jobs/workers/*
-src/jobs/schedulers/*
-workers/*
-modules/booking/services/expire-bookings.service.ts
-```
-
-## Cron Endpoint
+## Active Endpoints
 
 ```text
-GET  /api/cron/expire-bookings
-POST /api/cron/expire-bookings
+GET|POST /api/cron/expire-bookings
+GET|POST /api/cron/process-notifications?limit=25
 ```
 
-## Auth
-
-The booking-expiry cron route is protected by a shared secret.
+Both accept either:
 
 ```text
 Authorization: Bearer <CRON_SECRET>
-```
-
-or:
-
-```text
 x-cron-secret: <CRON_SECRET>
 ```
 
-## Booking Expiry Flow
+Production fails closed if the secret is absent. Development permits local invocation when no secret is configured. The secret must be high entropy, stored only in the deployment secret manager, rotated after exposure, and never placed in a frontend environment variable.
+
+## Booking Expiry
+
+The expiry job finds unpaid pending holds past `expiresAt`, conditionally claims them, changes status, and releases supported inventory. Confirmed or paid bookings are excluded. The result is a bounded summary rather than booking PII.
+
+## Notification Delivery
+
+Domain services atomically create `Notification` and `NotificationDelivery` rows. The worker:
+
+1. selects at most the requested bounded batch (1–100);
+2. atomically claims eligible or stale-locked rows;
+3. sends a privacy-minimized email with a provider idempotency key;
+4. marks success as `DELIVERED`; or
+5. schedules exponential retry and finally `DEAD_LETTER` after five attempts.
+
+The job is safe for overlapping scheduler invocations because each candidate is conditionally claimed. A 15-minute stale lock recovers interrupted work. Provider email failure does not undo a booking, payment, refund decision, inspection, or review operation.
+
+## Launch Scheduling
 
 ```text
-cron request
-  -> validate CRON_SECRET
-  -> call booking expiry service
-  -> find unpaid/expired pending bookings
-  -> release inventory/reservations where supported
-  -> update booking statuses
-  -> return summary result
+expire-bookings:       every minute
+process-notifications: every minute, begin with limit=25
 ```
 
-## Background Responsibilities
+Scale the notification batch only after measuring provider rate limits and database duration. Scheduler timeouts must remain above a normal batch duration but below the stale-lock window.
 
-```text
-booking expiry
-refund processing
-waitlist promotion
-contest result processing
-payout scheduling
-email sending
-notification fanout
-```
+## Required Monitoring
 
-## Testing Notes
+- Cron authentication failures and job duration.
+- Oldest pending notification age.
+- Counts by delivery status.
+- Failure and dead-letter rate.
+- Booking expiry count and inventory-release failures.
+- Provider bounce, complaint, and suppression webhooks after integration.
 
-```text
-Missing secret should return 401.
-Wrong secret should return 401.
-Correct secret should execute expiry service.
-Expired pending booking should be marked expired and release inventory.
-Non-expired booking should not be changed.
-Confirmed paid booking should not be expired.
-```
+Never log full notification messages, access tokens, OTPs, KYC values, evidence URLs, or provider credentials.
 
-## Production Notes
+## Production Validation Still Required
 
-```text
-Use external scheduler/cron provider to call cron routes.
-Keep CRON_SECRET private and rotate if exposed.
-Workers should be idempotent.
-Long-running jobs should use queue workers instead of request lifecycle when possible.
-```
+- Apply and rollback migrations on a staging clone.
+- Run two notification workers concurrently against isolated PostgreSQL.
+- Force provider timeout, rejection, success-after-timeout, and rate-limit responses.
+- Verify the same Brevo `headers.idempotencyKey` does not create a duplicate message.
+- Verify stale locks recover and attempt five dead-letters.
+- Exercise the implemented privacy-safe health queue and audited dead-letter replay before opening traffic; connect external alerts.
+
+Refund reconciliation, waitlist promotion, payout scheduling, community moderation, and retention jobs remain future active implementations; legacy queue/worker folders alone are not treated as completed behavior.

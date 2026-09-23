@@ -1,9 +1,6 @@
 import { NextRequest, NextResponse } from "next/server"
-import { cookies } from "next/headers"
-import { getServerSession } from "next-auth"
-import { authOptions } from "@/lib/auth"
-import { getUserFromSessionToken } from "@/modules/auth/services/auth.service"
-import { getHostByUserId } from "@/modules/host/services/host.service"
+import { requireHost } from "@/utils/host-auth"
+import { currentUserId } from "@/utils/user-auth"
 import {
   approveTourJoinRequest,
   createTourBooking,
@@ -24,25 +21,9 @@ import {
   verifyTourPayment,
 } from "@/modules/tour/services/tour.service"
 
-async function getAuthenticatedUserId() {
-  const token = (await cookies()).get("token")?.value
-  if (token) {
-    const user = await getUserFromSessionToken(token)
-    if (user?.id) return String(user.id)
-  }
-
-  const session = await getServerSession(authOptions)
-  return session?.user?.id ? String(session.user.id) : null
-}
-
 async function getCurrentHost() {
-  const session = await getServerSession(authOptions)
-  if (!session?.user?.id) return { error: NextResponse.json({ error: "Unauthorized" }, { status: 401 }) }
-
-  const host = await getHostByUserId(session.user.id)
-  if (!host) return { error: NextResponse.json({ error: "Not a host" }, { status: 403 }) }
-
-  return { host }
+  try { return { host: (await requireHost()).host } }
+  catch (error) { return { error: NextResponse.json({ error: error instanceof Error ? error.message : "Unauthorized" }, { status: typeof error === "object" && error && "statusCode" in error ? Number((error as { statusCode: number }).statusCode) : 401 }) } }
 }
 
 export const getTours = async (req?: Request) => {
@@ -59,7 +40,6 @@ export const getTours = async (req?: Request) => {
     }
 
     const tours = await listPublicTours()
-    console.log("Fetched public tours:", tours)
     return NextResponse.json({ data: tours })
   } catch (error) {
     console.error("GET /api/tour:", error)
@@ -99,8 +79,6 @@ export const createTourController = async (req: NextRequest) => {
 
     const body = await req.json()
     const { itinerary = [], ...tourData } = body
-    console.log("Creating tour with data:", tourData, "and itinerary:", itinerary)
-    console.log("body:", body)
 
     const tour = await createTour(host.id, tourData, itinerary)
     return NextResponse.json({ data: tour }, { status: 201 })
@@ -108,7 +86,8 @@ export const createTourController = async (req: NextRequest) => {
     console.error("POST /api/tour:", error)
     if ((error as { code?: string }).code === "P2002")
       return NextResponse.json({ error: "A tour with this slug already exists." }, { status: 409 })
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 })
+    const status = typeof error === "object" && error && "statusCode" in error ? Number((error as { statusCode?: number }).statusCode) || 500 : 500
+    return NextResponse.json({ error: error instanceof Error && status < 500 ? error.message : "Internal server error" }, { status })
   }
 }
 
@@ -129,7 +108,8 @@ export const updateTourController = async (req: NextRequest, id: string) => {
     console.error("PUT /api/tour/[id]:", error)
     if ((error as { code?: string }).code === "P2002")
       return NextResponse.json({ error: "A tour with this slug already exists." }, { status: 409 })
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 })
+    const status = typeof error === "object" && error && "statusCode" in error ? Number((error as { statusCode?: number }).statusCode) || 500 : 500
+    return NextResponse.json({ error: error instanceof Error && status < 500 ? error.message : "Internal server error" }, { status })
   }
 }
 
@@ -169,7 +149,7 @@ function errorStatus(message: string) {
 
 export const createJoinRequestController = async (req: NextRequest, tourId: string) => {
   try {
-    const userId = await getAuthenticatedUserId()
+    const userId = await currentUserId()
     if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
 
     const body = await req.json().catch(() => ({})) as { introduction?: string }
@@ -207,7 +187,7 @@ export const reviewJoinRequestController = async (req: NextRequest, requestId: s
 
 export const createTourBookingController = async (req: NextRequest, tourId: string) => {
   try {
-    const userId = await getAuthenticatedUserId()
+    const userId = await currentUserId()
     if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
 
     const body = await req.json().catch(() => ({}))
@@ -220,16 +200,15 @@ export const createTourBookingController = async (req: NextRequest, tourId: stri
   }
 }
 
-export const createTourPaymentOrderController = async (req: NextRequest, _tourId: string) => {
-  void _tourId
+export const createTourPaymentOrderController = async (req: NextRequest, tourId: string) => {
   try {
-    const userId = await getAuthenticatedUserId()
+    const userId = await currentUserId()
     if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
 
     const body = await req.json().catch(() => ({})) as { bookingId?: string }
     if (!body.bookingId) return NextResponse.json({ error: "bookingId is required" }, { status: 400 })
 
-    const data = await createTourPaymentOrder(userId, body.bookingId)
+    const data = await createTourPaymentOrder(userId, tourId, body.bookingId)
     return NextResponse.json({ success: true, data })
   } catch (error) {
     const message = error instanceof Error ? error.message : "Failed to create payment order"
@@ -238,14 +217,13 @@ export const createTourPaymentOrderController = async (req: NextRequest, _tourId
   }
 }
 
-export const verifyTourPaymentController = async (req: NextRequest, _tourId: string) => {
-  void _tourId
+export const verifyTourPaymentController = async (req: NextRequest, tourId: string) => {
   try {
-    const userId = await getAuthenticatedUserId()
+    const userId = await currentUserId()
     if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
 
     const body = await req.json()
-    const data = await verifyTourPayment(userId, body)
+    const data = await verifyTourPayment(userId, tourId, body)
     return NextResponse.json({ success: true, data })
   } catch (error) {
     const message = error instanceof Error ? error.message : "Failed to verify payment"
@@ -256,7 +234,7 @@ export const verifyTourPaymentController = async (req: NextRequest, _tourId: str
 
 export const listTourParticipantsController = async (_req: NextRequest, tourId: string) => {
   try {
-    const userId = await getAuthenticatedUserId()
+    const userId = await currentUserId()
     if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
 
     const data = await listTourParticipants(userId, tourId)
@@ -271,7 +249,7 @@ export const listTourParticipantsController = async (_req: NextRequest, tourId: 
 export const getTourChatController = async (_req: NextRequest, tourId: string) => {
   const scope = new URL(_req.url).searchParams.get("scope") === "participant" ? "participant" : "host-or-participant"
   try {
-    const userId = await getAuthenticatedUserId()
+    const userId = await currentUserId()
     if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
 
     const data = await getTourChatPreview(userId, tourId, scope)
@@ -289,7 +267,7 @@ export const getTourChatController = async (_req: NextRequest, tourId: string) =
 export const sendTourChatMessageController = async (req: NextRequest, tourId: string) => {
   const scope = new URL(req.url).searchParams.get("scope") === "participant" ? "participant" : "host-or-participant"
   try {
-    const userId = await getAuthenticatedUserId()
+    const userId = await currentUserId()
     if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
 
     const body = await req.json().catch(() => ({})) as { message?: string }

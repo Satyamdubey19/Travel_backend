@@ -1,9 +1,10 @@
 import { PrismaPg } from "@prisma/adapter-pg"
 import { PrismaClient } from "@prisma/client"
 import { Pool } from "pg"
+import { requiredEnv, validateProductionEnvironment } from "@/lib/env"
 
-const connectionString =
-  process.env.DATABASE_URL ?? "postgresql://postgres:1234@localhost:5432/travel_booking"
+validateProductionEnvironment()
+const connectionString = requiredEnv("DATABASE_URL")
 
 const globalForPrisma = globalThis as typeof globalThis & {
   prisma?: PrismaClient
@@ -19,6 +20,11 @@ const pool =
     connectionTimeoutMillis: 10_000,
     maxUses: 7_500,
   })
+
+pool.on("error", (err) => {
+  console.warn("Neon pooler idle connection recycled:", err.message);
+});
+
 
 const prisma =
   globalForPrisma.prisma ??

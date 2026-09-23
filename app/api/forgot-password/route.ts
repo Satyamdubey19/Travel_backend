@@ -1,5 +1,6 @@
 import { forgotPassword } from "@/modules/auth/controllers/auth.controller";
+import type { NextRequest } from "next/server";
 
-export async function POST(req:Request) {
-  return forgotPassword(req as any);
+export async function POST(req: NextRequest) {
+  return forgotPassword(req);
 }

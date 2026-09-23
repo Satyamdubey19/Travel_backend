@@ -62,7 +62,7 @@ Strict Zod schemas reject unknown auth payload fields.
 Remaining production-hardening risks:
 
 ```text
-JWT access-token revocation and session invalidation are still process-memory based. Move those to Redis/database or a persisted session version before multi-instance deployment.
+New JWT access tokens are persisted-session bound and logout is checked against PostgreSQL across instances. Legacy tokens without the session claim remain a short-lived compatibility risk and must be drained or allowed to expire during deployment.
 Registration conflict responses still disclose whether an email or phone exists.
 Legacy /api/verify remains and can confuse QA or old clients.
 Profile text accepts HTML-like values, so frontend output escaping must be guaranteed.
@@ -281,4 +281,4 @@ Remove inactive duplicate auth files under src/modules/auth or mark them clearly
 
 ## Final Assessment
 
-The auth module is now substantially safer than the original audited version. Redis-backed rate limits, email verification token storage, and refresh-token storage are available when REDIS_URL is configured. The remaining production risk is JWT access-token revocation/session invalidation, which is still process-memory based and should move to Redis/database or a persisted session version before multi-instance deployment.
+The auth module is now substantially safer than the original audited version. Redis-backed rate limits, email verification token storage, and refresh-token storage are available when `REDIS_URL` is configured. New custom access tokens are bound to a persisted session/device row, making logout enforceable across processes; legacy tokens without the session claim remain a short-lived compatibility limitation until expiry.

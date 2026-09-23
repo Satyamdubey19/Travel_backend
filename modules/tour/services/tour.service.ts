@@ -1,17 +1,21 @@
-import { createHmac } from "crypto"
+import { createHmac, randomBytes, timingSafeEqual } from "crypto"
 import { Prisma } from "@prisma/client"
 import { prisma } from "@/lib/prisma"
 import { razorpay } from "@/lib/razorpay"
-import { sendBookingConfirmationEmail } from "@/lib/mail"
-import type { ListingStatus, TourDifficulty } from "@prisma/client"
-import { tours as demoTours, type Tour } from "@/lib/tours"
+import { requiredEnv } from "@/lib/env"
+import { queueNotification } from "@/modules/notification/services/notification-outbox.service"
+import { requireTourCircleAccess } from "./tour-circle-access.service"
+import { blockedUserIdsFor } from "@/modules/community/services/community-safety.service"
+import { assertTourSafetyReady } from "@/modules/tour/services/tour-listing-policy"
+import type { ListingStatus, TourDifficulty, TourRiskLevel } from "@prisma/client"
+import type { Tour } from "@/lib/tours"
 
 const TAX_RATE = 0.12
 const PLATFORM_FEE_RATE = 0.1
 
 function generateBookingCode() {
   const timestamp = Date.now().toString(36).toUpperCase()
-  const random = Math.random().toString(36).slice(2, 7).toUpperCase()
+  const random = randomBytes(4).toString("hex").toUpperCase()
   return `GT${timestamp}${random}`
 }
 
@@ -25,104 +29,16 @@ function addDays(date: Date, days: number) {
   return next
 }
 
-function makeFutureDate(daysAhead: number) {
-  return addDays(new Date(), daysAhead)
-}
-
-function parseGroupBounds(value: string) {
-  const matches = value.match(/\d+/g)?.map(Number) ?? []
-  const lower = matches[0] ?? 2
-  const upper = matches[matches.length - 1] ?? lower
-  return { lower, upper }
-}
-
-function mapDemoTourToInput(demoTour: Tour) {
-  const { lower, upper } = parseGroupBounds(demoTour.groupSize)
-  const startDate = makeFutureDate(14)
-  const endDate = addDays(startDate, Math.max(1, demoTour.duration - 1))
-
-  return {
-    tourData: {
-      slug: demoTour.slug,
-      title: demoTour.title,
-      description: demoTour.description,
-      destination: demoTour.destination,
-      city: demoTour.location.city,
-      country: demoTour.location.country,
-      latitude: String(demoTour.location.lat),
-      longitude: String(demoTour.location.lng),
-      startDate: startDate.toISOString(),
-      endDate: endDate.toISOString(),
-      registrationDeadline: addDays(startDate, -7).toISOString(),
-      duration: String(demoTour.duration),
-      maxGroupSize: String(upper),
-      totalSlots: String(upper),
-      availableSlots: String(lower),
-      pricePerPerson: String(demoTour.price),
-      originalPrice: String(Math.round(demoTour.price * 1.18)),
-      difficulty: "MODERATE",
-      category: demoTour.category,
-      tags: demoTour.tags,
-      joinApprovalRequired: Boolean(demoTour.joinApprovalRequired),
-      womenOnly: Boolean(demoTour.womenOnly),
-      safeForSoloWomen: Boolean(demoTour.safeForSoloWomen),
-      verifiedTravelersOnly: Boolean(demoTour.verifiedTravelersOnly),
-      images: demoTour.gallery.length > 0 ? demoTour.gallery : [demoTour.image],
-      highlights: demoTour.highlights,
-      included: demoTour.budget.inclusions,
-      excluded: demoTour.budget.exclusions,
-      languages: ["English", "Hindi"],
-      cancellationPolicy: "Free cancellation up to 7 days before departure.",
-      status: "ACTIVE",
-    },
-    itinerary: demoTour.itinerary.map((day) => ({
-      day: day.day,
-      title: day.title,
-      description: day.description,
-      activities: day.activities,
-      meals: day.meals,
-    })),
-  }
-}
-
-async function ensureDemoTourRecord(tourKey: string) {
-  const existing = await prisma.tour.findFirst({ where: { OR: [{ id: tourKey }, { slug: tourKey }], deletedAt: null } })
-  if (existing) return existing
-
-  const demoTour = demoTours.find((item) => item.slug === tourKey || item.id === tourKey)
-  if (!demoTour) return null
-
-  const host = await prisma.host.findFirst({ orderBy: { createdAt: "asc" } })
-  if (!host) {
-    const fallbackUser = await prisma.user.findFirst({ orderBy: { createdAt: "asc" } })
-    if (!fallbackUser) throw new Error("No host or user exists to attach the demo tour")
-
-    const createdHost = await prisma.host.upsert({
-      where: { userId: fallbackUser.id },
-      update: {},
-      create: {
-        userId: fallbackUser.id,
-        businessName: "GetHotels Experiences",
-        hostType: "TOUR_OPERATOR",
-        businessType: "INDIVIDUAL",
-        isActive: true,
-        isApproved: true,
-        isVerified: true,
-      },
-    })
-
-    const { tourData, itinerary } = mapDemoTourToInput(demoTour)
-    return createTour(createdHost.id, tourData, itinerary)
-  }
-
-  const { tourData, itinerary } = mapDemoTourToInput(demoTour)
-  return createTour(host.id, tourData, itinerary)
-}
-
 function publicTourWhere(id: string) {
   return {
     OR: [{ id }, { slug: id }],
     deletedAt: null,
+    status: "ACTIVE" as const,
+    isActive: true,
+    isApproved: true,
+    riskDisclosure: { not: null },
+    meetingPoint: { not: null },
+    Host: { is: { isActive: true, isApproved: true, isVerified: true } },
   }
 }
 
@@ -165,6 +81,14 @@ export type TourInput = {
   excluded?: string[]
   languages?: string | string[]
   cancellationPolicy?: string
+  riskLevel?: string
+  riskDisclosure?: string
+  meetingPoint?: string
+  eligibilityRequirements?: string[]
+  requiredEquipment?: string[]
+  emergencyPlan?: string
+  minimumAge?: string | number
+  requiresCaretaker?: boolean
   status?: string
 }
 
@@ -189,6 +113,30 @@ export type VerifyTourPaymentInput = {
   razorpay_order_id: string
   razorpay_payment_id: string
   razorpay_signature: string
+}
+
+function validateTourListing(tourData: TourInput) {
+  const invalid = (message: string) => { throw Object.assign(new Error(message), { statusCode: 400 }) }
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(tourData.slug?.trim() || "")) invalid("Tour slug must use lowercase words separated by hyphens")
+  if ((tourData.title?.trim().length || 0) < 5) invalid("Tour title must be at least 5 characters")
+  if ((tourData.description?.trim().length || 0) < 40) invalid("Tour description must be at least 40 characters")
+  if ((tourData.destination?.trim().length || 0) < 2) invalid("Tour destination is required")
+  const duration = Number(tourData.duration)
+  const groupSize = Number(tourData.maxGroupSize)
+  const totalSlots = Number(tourData.totalSlots ?? tourData.maxGroupSize)
+  const availableSlots = Number(tourData.availableSlots ?? totalSlots)
+  const price = Number(tourData.pricePerPerson)
+  if (!Number.isInteger(duration) || duration < 1 || duration > 90) invalid("Tour duration must be between 1 and 90 days")
+  if (!Number.isInteger(groupSize) || groupSize < 1 || groupSize > 100) invalid("Group size must be between 1 and 100")
+  if (!Number.isInteger(totalSlots) || totalSlots < 1 || totalSlots > groupSize) invalid("Total slots must be within the group size")
+  if (!Number.isInteger(availableSlots) || availableSlots < 0 || availableSlots > totalSlots) invalid("Available slots must be between zero and total slots")
+  if (!Number.isFinite(price) || price <= 0 || price > 10_000_000) invalid("Tour price must be greater than zero")
+  if ((tourData.cancellationPolicy?.trim().length || 0) < 20) invalid("A clear cancellation policy of at least 20 characters is required")
+  if (!tourData.images?.some((image) => image.trim())) invalid("At least one tour image is required")
+  const startDate = tourData.startDate ? new Date(tourData.startDate) : null
+  const endDate = tourData.endDate ? new Date(tourData.endDate) : null
+  if (!startDate || Number.isNaN(startDate.getTime()) || !endDate || Number.isNaN(endDate.getTime()) || endDate < startDate) invalid("Valid start and end dates are required")
+  assertTourSafetyReady(tourData)
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -233,7 +181,7 @@ function isTransientDatabaseError(error: unknown) {
 
 async function queryPublicTours() {
   return prisma.tour.findMany({
-    where: { status: "ACTIVE", isActive: true, isApproved: true },
+    where: { status: "ACTIVE", isActive: true, isApproved: true, deletedAt: null, riskDisclosure: { not: null }, meetingPoint: { not: null }, Host: { is: { isActive: true, isApproved: true, isVerified: true } } },
     include: {
       TourItineraryDay: { orderBy: { day: "asc" } },
       _count: { select: { Booking: true, Review: true } },
@@ -251,19 +199,13 @@ export async function listPublicTours() {
     })
 
     return tours.map(normalizeTourForPublic)
-  } catch (error) {
-    if (!isTransientDatabaseError(error)) throw error
-    console.warn("GET /api/tour: using fallback tours after database connection drop")
-    return demoTours
-  }
+  } catch (error) { throw error }
 }
 
 export async function getPublicTourBySlug(slug: string) {
-  await ensureDemoTourRecord(slug)
   const tour = await prisma.tour.findFirst({
     where: {
-      OR: [{ slug }, { id: slug }],
-      deletedAt: null,
+      ...publicTourWhere(slug),
     },
     include: {
       TourItineraryDay: { orderBy: { day: "asc" } },
@@ -329,6 +271,15 @@ type PublicTourRecord = {
   included: string[]
   excluded: string[]
   difficulty: string
+  riskLevel: string
+  riskDisclosure: string | null
+  meetingPoint: string | null
+  eligibilityRequirements: string[]
+  requiredEquipment: string[]
+  emergencyPlan: string | null
+  minimumAge: number
+  requiresCaretaker: boolean
+  languages: string[]
   category: string | null
   TourItineraryDay: {
     day: number
@@ -366,6 +317,17 @@ export function normalizeTourForPublic(tour: PublicTourRecord): Tour {
     womenOnly: tour.womenOnly,
     safeForSoloWomen: tour.safeForSoloWomen,
     verifiedTravelersOnly: tour.verifiedTravelersOnly,
+    riskLevel: tour.riskLevel,
+    riskDisclosure: tour.riskDisclosure ?? "",
+    meetingPoint: tour.meetingPoint ?? "",
+    eligibilityRequirements: tour.eligibilityRequirements,
+    requiredEquipment: tour.requiredEquipment,
+    // Operational response plans can contain private contacts and routes. Public
+    // clients only need to know that a reviewed plan exists.
+    emergencyPlanRecorded: Boolean(tour.emergencyPlan?.trim()),
+    minimumAge: tour.minimumAge,
+    requiresCaretaker: tour.requiresCaretaker,
+    languages: tour.languages,
     rating: tour.averageRating,
     reviews: tour.totalReviews || tour._count?.Review || 0,
     image: images[0],
@@ -398,6 +360,7 @@ export async function createTour(
   tourData: TourInput,
   itinerary: ItineraryDayInput[],
 ) {
+  validateTourListing(tourData)
   const languages = parseLanguages(tourData.languages)
   const totalSlots = parseInt(tourData.totalSlots ?? tourData.maxGroupSize ?? "20") || 20
   const availableSlots = Math.min(parseInt(tourData.availableSlots ?? String(totalSlots)) || totalSlots, totalSlots)
@@ -427,6 +390,14 @@ export async function createTour(
         pricePerPerson: parseFloat(tourData.pricePerPerson) || 0,
         originalPrice: tourData.originalPrice ? parseFloat(tourData.originalPrice) : null,
         difficulty: (tourData.difficulty || "MODERATE") as TourDifficulty,
+        riskLevel: (tourData.riskLevel || "LOW") as TourRiskLevel,
+        riskDisclosure: tourData.riskDisclosure?.trim() || null,
+        meetingPoint: tourData.meetingPoint?.trim() || null,
+        eligibilityRequirements: (tourData.eligibilityRequirements ?? []).map((item) => item.trim()).filter(Boolean),
+        requiredEquipment: (tourData.requiredEquipment ?? []).map((item) => item.trim()).filter(Boolean),
+        emergencyPlan: tourData.emergencyPlan?.trim() || null,
+        minimumAge: Number(tourData.minimumAge),
+        requiresCaretaker: tourData.requiresCaretaker ?? false,
         category: tourData.category || null,
         tags: (tourData.tags ?? []).filter(Boolean),
         joinApprovalRequired: tourData.joinApprovalRequired ?? false,
@@ -439,7 +410,9 @@ export async function createTour(
         excluded: (tourData.excluded ?? []).filter(Boolean),
         languages,
         cancellationPolicy: tourData.cancellationPolicy || null,
-        status: (tourData.status || "PENDING_REVIEW") as ListingStatus,
+        status: "PENDING_REVIEW" as ListingStatus,
+        isApproved: false,
+        submittedForReviewAt: new Date(),
       },
     })
 
@@ -465,6 +438,7 @@ export async function updateTour(
   tourData: TourInput,
   itinerary: ItineraryDayInput[],
 ) {
+  validateTourListing(tourData)
   const languages = parseLanguages(tourData.languages)
   const totalSlots = parseInt(tourData.totalSlots ?? tourData.maxGroupSize ?? "20") || 20
   const availableSlots = Math.min(parseInt(tourData.availableSlots ?? String(totalSlots)) || totalSlots, totalSlots)
@@ -494,6 +468,14 @@ export async function updateTour(
         pricePerPerson: parseFloat(tourData.pricePerPerson) || 0,
         originalPrice: tourData.originalPrice ? parseFloat(tourData.originalPrice) : null,
         difficulty: (tourData.difficulty || "MODERATE") as TourDifficulty,
+        riskLevel: (tourData.riskLevel || "LOW") as TourRiskLevel,
+        riskDisclosure: tourData.riskDisclosure?.trim() || null,
+        meetingPoint: tourData.meetingPoint?.trim() || null,
+        eligibilityRequirements: (tourData.eligibilityRequirements ?? []).map((item) => item.trim()).filter(Boolean),
+        requiredEquipment: (tourData.requiredEquipment ?? []).map((item) => item.trim()).filter(Boolean),
+        emergencyPlan: tourData.emergencyPlan?.trim() || null,
+        minimumAge: Number(tourData.minimumAge),
+        requiresCaretaker: tourData.requiresCaretaker ?? false,
         category: tourData.category || null,
         tags: (tourData.tags ?? []).filter(Boolean),
         joinApprovalRequired: tourData.joinApprovalRequired ?? false,
@@ -506,7 +488,10 @@ export async function updateTour(
         excluded: (tourData.excluded ?? []).filter(Boolean),
         languages,
         cancellationPolicy: tourData.cancellationPolicy || null,
-        status: (tourData.status || "PENDING_REVIEW") as ListingStatus,
+        status: "PENDING_REVIEW" as ListingStatus,
+        isApproved: false,
+        approvedAt: null,
+        submittedForReviewAt: new Date(),
       },
     })
 
@@ -527,12 +512,11 @@ export async function updateTour(
 }
 
 export async function deleteTour(id: string) {
-  return prisma.tour.delete({ where: { id } })
+  return prisma.tour.update({ where: { id }, data: { status: "ARCHIVED", isActive: false, isApproved: false, archivedAt: new Date() } })
 }
 
 export async function checkTourJoinEligibility(userId: string, tourId: string) {
-  const ensured = await ensureDemoTourRecord(tourId)
-  const tour = ensured ?? await prisma.tour.findFirst({
+  const tour = await prisma.tour.findFirst({
     where: publicTourWhere(tourId),
     select: {
       id: true,
@@ -728,6 +712,7 @@ export async function createTourBooking(userId: string, tourId: string, input: T
       totalAmount: new Prisma.Decimal(totalAmount),
       currency: "INR",
       status: "PENDING",
+      expiresAt: new Date(Date.now() + 15 * 60 * 1000),
       Payment: {
         create: {
           userId,
@@ -757,27 +742,41 @@ export async function createTourBooking(userId: string, tourId: string, input: T
   })
 }
 
-export async function createTourPaymentOrder(userId: string, bookingId: string) {
+export async function createTourPaymentOrder(userId: string, tourId: string, bookingId: string) {
   const razorpayKeyId = process.env.RAZORPAY_KEY_ID ?? process.env.NEXT_PUBLIC_RAZORPAY_KEY_ID
   if (!razorpayKeyId) throw new Error("Razorpay key id is not configured")
 
+  const bridgeRows = await prisma.$queryRaw<{ legacyBookingId: string | null; status: string; expiresAt: Date | null }[]>`
+    SELECT "legacyBookingId", "status", "expiresAt" FROM "TourBooking"
+    WHERE "id" = ${bookingId} AND "tourId" = ${tourId} AND "userId" = ${userId} AND "deletedAt" IS NULL LIMIT 1
+  `
+  const bridge = bridgeRows[0]
+  if (bridge?.status === "WAITLISTED") throw new Error("Waitlisted groups cannot pay until seats are offered")
+  if (bridge?.expiresAt && bridge.expiresAt <= new Date()) throw new Error("This booking hold has expired")
+  const commerceBookingId = bridge?.legacyBookingId ?? bookingId
+
   const booking = await prisma.booking.findFirst({
-    where: { id: bookingId, userId, tourId: { not: null }, status: "PENDING" },
+    where: { id: commerceBookingId, userId, tourId, status: "PENDING", OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
     include: { Payment: true, Tour: { select: { title: true } } },
   })
 
   if (!booking || !booking.Payment) throw new Error("Pending tour booking not found")
+  if (booking.Payment.providerOrderId && ["PENDING", "PROCESSING"].includes(booking.Payment.status)) {
+    return { bookingId, bookingCode: booking.bookingCode, orderId: booking.Payment.providerOrderId, amount: Math.round(Number(booking.totalAmount) * 100), currency: booking.currency, keyId: razorpayKeyId }
+  }
+  const claimed = await prisma.payment.updateMany({ where: { id: booking.Payment.id, status: "PENDING", providerOrderId: null }, data: { status: "PROCESSING" } })
+  if (claimed.count !== 1) throw new Error("Payment order creation is already in progress")
 
-  const order = await razorpay.orders.create({
-    amount: Math.round(Number(booking.totalAmount) * 100),
-    currency: booking.currency,
-    receipt: booking.bookingCode,
-    notes: {
-      bookingId: booking.id,
-      bookingCode: booking.bookingCode,
-      tour: booking.Tour?.title ?? "Tour",
-    },
-  })
+  let order
+  try {
+    order = await razorpay.orders.create({
+      amount: Math.round(Number(booking.totalAmount) * 100), currency: booking.currency, receipt: booking.bookingCode,
+      notes: { bookingId: booking.id, tourBookingId: bridge ? bookingId : "", bookingCode: booking.bookingCode, tour: booking.Tour?.title ?? "Tour" },
+    })
+  } catch (error) {
+    await prisma.payment.updateMany({ where: { id: booking.Payment.id, providerOrderId: null, status: "PROCESSING" }, data: { status: "PENDING" } })
+    throw error
+  }
 
   await prisma.payment.update({
     where: { bookingId: booking.id },
@@ -788,7 +787,7 @@ export async function createTourPaymentOrder(userId: string, bookingId: string) 
   })
 
   return {
-    bookingId: booking.id,
+    bookingId,
     bookingCode: booking.bookingCode,
     orderId: order.id,
     amount: order.amount,
@@ -797,15 +796,17 @@ export async function createTourPaymentOrder(userId: string, bookingId: string) 
   }
 }
 
-export async function verifyTourPayment(userId: string, input: VerifyTourPaymentInput) {
-  const expected = createHmac("sha256", process.env.RAZORPAY_KEY_SECRET ?? "")
+export async function verifyTourPayment(userId: string, tourId: string, input: VerifyTourPaymentInput) {
+  const expected = createHmac("sha256", requiredEnv("RAZORPAY_KEY_SECRET"))
     .update(`${input.razorpay_order_id}|${input.razorpay_payment_id}`)
     .digest("hex")
 
-  if (expected !== input.razorpay_signature) throw new Error("Invalid payment signature")
+  const expectedBuffer = Buffer.from(expected, "hex")
+  const actualBuffer = Buffer.from(input.razorpay_signature, "hex")
+  if (expectedBuffer.length !== actualBuffer.length || !timingSafeEqual(expectedBuffer, actualBuffer)) throw new Error("Invalid payment signature")
 
   const payment = await prisma.payment.findFirst({
-    where: { providerOrderId: input.razorpay_order_id, userId },
+    where: { providerOrderId: input.razorpay_order_id, userId, Booking: { tourId } },
     include: { Booking: { include: { Tour: true } } },
   })
 
@@ -821,7 +822,11 @@ export async function confirmTourBooking(bookingId: string, providerPaymentId?: 
     })
 
     if (!existing?.Tour || !existing.tourId) throw new Error("Tour booking not found")
-    if (existing.status === "CONFIRMED") return existing
+    if (existing.status === "CONFIRMED") {
+      await tx.$executeRaw`UPDATE "TourBooking" SET "status" = 'CONFIRMED', "paymentStatus" = 'SUCCESS', "confirmedCount" = "travelersCount", "waitlistedCount" = 0, "confirmedAt" = COALESCE("confirmedAt", CURRENT_TIMESTAMP), "updatedAt" = CURRENT_TIMESTAMP WHERE "legacyBookingId" = ${existing.id}`
+      await tx.$executeRaw`UPDATE "TourTraveler" SET "status" = 'CONFIRMED', "updatedAt" = CURRENT_TIMESTAMP WHERE "tourBookingId" IN (SELECT "id" FROM "TourBooking" WHERE "legacyBookingId" = ${existing.id}) AND "status" <> 'CANCELLED'`
+      return existing
+    }
     if (existing.status !== "PENDING") throw new Error("Booking cannot be confirmed")
     if (existing.Tour.availableSlots < existing.totalGuests) throw new Error("Not enough tour slots available")
 
@@ -878,7 +883,10 @@ export async function confirmTourBooking(bookingId: string, providerPaymentId?: 
       update: {},
     })
 
-    return tx.booking.update({
+    await tx.$executeRaw`UPDATE "TourBooking" SET "status" = 'CONFIRMED', "paymentStatus" = 'SUCCESS', "confirmedCount" = "travelersCount", "waitlistedCount" = 0, "confirmedAt" = CURRENT_TIMESTAMP, "updatedAt" = CURRENT_TIMESTAMP WHERE "legacyBookingId" = ${existing.id}`
+    await tx.$executeRaw`UPDATE "TourTraveler" SET "status" = 'CONFIRMED', "updatedAt" = CURRENT_TIMESTAMP WHERE "tourBookingId" IN (SELECT "id" FROM "TourBooking" WHERE "legacyBookingId" = ${existing.id}) AND "status" <> 'CANCELLED'`
+
+    const confirmedBooking = await tx.booking.update({
       where: { id: existing.id },
       data: {
         status: "CONFIRMED",
@@ -896,47 +904,29 @@ export async function confirmTourBooking(bookingId: string, providerPaymentId?: 
         TourParticipant: true,
       },
     })
+
+    await queueNotification(tx, {
+      data: {
+        userId: existing.userId,
+        type: "BOOKING_CONFIRMED",
+        title: "Tour booking confirmed",
+        message: `Booking ${existing.bookingCode} is confirmed and group access is unlocked.`,
+        data: { bookingId: existing.id, product: "tour" },
+      },
+    })
+
+    return confirmedBooking
   }, {
     isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
     maxWait: 10000,
     timeout: 20000,
   })
 
-  await sendBookingConfirmationEmail({
-    to: booking.contactEmail,
-    guestName: booking.contactName,
-    bookingCode: booking.bookingCode,
-    listingName: booking.Tour?.title ?? "GetHotels tour",
-    city: booking.Tour?.city ?? booking.Tour?.destination,
-    checkIn: booking.checkIn ?? new Date(),
-    checkOut: booking.checkOut ?? booking.checkIn ?? new Date(),
-    totalAmount: booking.totalAmount,
-    currency: booking.currency,
-    rooms: [{
-      roomName: "Tour seat",
-      quantity: booking.totalGuests,
-      nights: 1,
-      pricePerNight: booking.subtotal,
-      total: booking.totalAmount,
-    }],
-    bookingUrl: `${process.env.NEXTAUTH_URL ?? "http://localhost:3000"}/profile`,
-  }).catch((error) => {
-    console.error("Failed to send tour confirmation email:", error)
-  })
-
   return booking
 }
 
 export async function listTourParticipants(userId: string, tourId: string) {
-  await ensureDemoTourRecord(tourId)
-  const tour = await prisma.tour.findFirst({ where: { OR: [{ id: tourId }, { slug: tourId }] }, select: { id: true, hostId: true } })
-  if (!tour) throw new Error("Tour not found")
-
-  const access = await prisma.tourParticipant.findUnique({
-    where: { tourId_userId: { tourId: tour.id, userId } },
-    select: { id: true },
-  })
-  if (!access) throw new Error("Join the tour to view participants")
+  const { tour } = await requireTourCircleAccess(userId, tourId, { allowCompletedTour: true })
 
   return prisma.tourParticipant.findMany({
     where: { tourId: tour.id, status: { in: ["APPROVED", "JOINED", "COMPLETED"] } },
@@ -970,13 +960,17 @@ export async function listTourParticipants(userId: string, tourId: string) {
 export type TourChatAccessScope = "host-or-participant" | "participant"
 
 export async function getTourChatPreview(userId: string, tourId: string, scope: TourChatAccessScope = "host-or-participant") {
-  await ensureDemoTourRecord(tourId)
   const { tour } = await getActiveTourChatAccess(userId, tourId, scope)
+  const blockedUserIds = [...await blockedUserIdsFor(userId)]
 
   const room = await prisma.tourChatRoom.findUnique({
     where: { tourId: tour.id },
     include: {
       messages: {
+        where: {
+          deletedAt: null,
+          ...(blockedUserIds.length > 0 ? { senderId: { notIn: blockedUserIds } } : {}),
+        },
         orderBy: { createdAt: "desc" },
         take: 20,
         include: { User: { select: { id: true, name: true } } },
@@ -988,37 +982,14 @@ export async function getTourChatPreview(userId: string, tourId: string, scope: 
 }
 
 async function getActiveTourChatAccess(userId: string, tourId: string, scope: TourChatAccessScope = "host-or-participant") {
-  const tour = await prisma.tour.findFirst({
-    where: { OR: [{ id: tourId }, { slug: tourId }] },
-    select: { id: true, hostId: true, title: true, tourStatus: true },
-  })
-  if (!tour) throw new Error("Tour not found")
-  if (["COMPLETED", "CANCELLED"].includes(tour.tourStatus)) {
-    throw new Error("Tour chat is closed because this tour is no longer active")
+  const access = await requireTourCircleAccess(userId, tourId)
+  if (scope === "participant" && access.isHost && !access.participant) {
+    throw Object.assign(new Error("A confirmed active booking is required for this Trip Circle"), { statusCode: 403 })
   }
-
-  const [participant, host] = await Promise.all([
-    prisma.tourParticipant.findUnique({
-      where: { tourId_userId: { tourId: tour.id, userId } },
-      select: { id: true, status: true },
-    }),
-    prisma.host.findFirst({
-      where: { id: tour.hostId, userId },
-      select: { id: true },
-    }),
-  ])
-
-  const canChatAsParticipant = participant?.status === "JOINED"
-  const canChatAsHost = scope === "host-or-participant" && Boolean(host)
-  if (!canChatAsHost && !canChatAsParticipant) {
-    throw new Error("Join the tour to unlock group chat")
-  }
-
-  return { tour, participant }
+  return { tour: access.tour, participant: access.participant }
 }
 
 export async function sendTourChatMessage(userId: string, tourId: string, message: string, scope: TourChatAccessScope = "host-or-participant") {
-  await ensureDemoTourRecord(tourId)
   const cleanMessage = message.trim()
   if (!cleanMessage) throw new Error("Message is required")
   if (cleanMessage.length > 2000) throw new Error("Message is too long")

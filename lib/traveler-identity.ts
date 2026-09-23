@@ -3,7 +3,8 @@ export { aadhaarLast4, isValidAadhaar, maskAadhaar, normalizeAadhaar, normalizeT
 import { normalizeAadhaar } from "@/lib/traveler-normalization"
 
 function aadhaarSecret() {
-  const secret = process.env.AADHAAR_HASH_SECRET || process.env.NEXTAUTH_SECRET || process.env.JWT_SECRET || process.env.DATABASE_URL
+  const secret = process.env.AADHAAR_HASH_SECRET
+  if (!secret) throw new Error("AADHAAR_HASH_SECRET is required before traveler identity data can be processed")
   if (!secret) {
     throw new Error("Aadhaar hashing secret is not configured")
   }

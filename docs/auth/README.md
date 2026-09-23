@@ -16,6 +16,9 @@ AUTH_QA_SECURITY_AUDIT.md
 
 AUTH_ADVERSARIAL_TESTING.md
   Adversarial attack-path report with proof-of-concept requests and mitigation status.
+
+AUTH_CURRENT_RELEASE_GATE.md
+  Authoritative current release gate, current evidence, unresolved authentication limitations, and the required safe verification sequence.
 ```
 
 ## Current Auth Rules
@@ -37,7 +40,7 @@ Login, register, reset, forgot-password, verify, update, and logout use Redis-ba
 Logout revokes the current access token in memory and deletes the matching refresh token from Redis.
 Logout and device logout mark UserDevice/Session rows inactive.
 Password reset deletes all Redis refresh tokens and deactivates all sessions/devices for the user.
-JWT access-token revocation remains in-memory; Redis currently covers rate limits, email verification tokens, and refresh-token state.
+New custom JWT access tokens are bound to the persisted session/device row, so logout is enforceable across processes. Redis covers rate limits, email verification tokens, and refresh-token state when configured; legacy tokens without a session claim remain valid only until their short expiry.
 ```
 
 Start with `AUTH_MODULE.md` for architecture and `AUTH_API_POSTMAN.md` for manual testing.

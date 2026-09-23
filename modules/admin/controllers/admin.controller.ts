@@ -1,7 +1,9 @@
 import type { NextRequest } from "next/server"
 import { requireAdmin } from "@/utils/admin-auth"
 import { fail, ok } from "@/utils/api-response"
+import { assertTrustedOrigin } from "@/modules/auth/services/auth-security.service"
 import { getListQuery, paginationMeta } from "@/utils/admin-query"
+import { hasValidAdminStepUp, requireAdminStepUp } from "@/modules/admin/services/admin-step-up.service"
 import {
   decideAdminKyc,
   getAdminDashboard,
@@ -42,6 +44,7 @@ function messageFromError(error: unknown) {
 
 async function withAdmin<T>(request: NextRequest, handler: (admin: Awaited<ReturnType<typeof requireAdmin>>) => Promise<T>) {
   try {
+    if (!["GET", "HEAD", "OPTIONS"].includes(request.method)) assertTrustedOrigin(request)
     const admin = await requireAdmin(request)
     return await handler(admin)
   } catch (error) {
@@ -118,18 +121,20 @@ export async function adminUpdatePayout(request: NextRequest, context: RoutePara
 }
 
 export async function adminKyc(request: NextRequest) {
-  return withAdmin(request, async () => {
+  return withAdmin(request, async (admin) => {
     const query = getListQuery(request)
     if (!query.status) {
       query.status = request.nextUrl.searchParams.get("status") ?? "PENDING"
     }
-    const result = await listAdminKyc(query)
+    const hasStepUp = hasValidAdminStepUp(request, admin.id)
+    const result = await listAdminKyc(query, hasStepUp)
     return ok(result.rows, paginationMeta(result.total, query.page, query.limit))
   })
 }
 
 export async function adminUpdateKyc(request: NextRequest, context: RouteParams) {
   return withAdmin(request, async (admin) => {
+    requireAdminStepUp(request, admin.id)
     const { id } = await context.params
     const input = await parseKycDecision(request)
     return ok(await decideAdminKyc(id, admin, input))

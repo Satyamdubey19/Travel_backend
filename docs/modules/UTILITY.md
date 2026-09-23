@@ -15,7 +15,7 @@ app/api/forgot-password/route.ts
 app/api/reset-password/route.ts
 app/api/verify/route.ts
 lib/cloudinary.ts
-lib/resend.ts
+lib/brevo.ts
 middleware/multer.ts
 ```
 

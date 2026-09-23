@@ -20,6 +20,10 @@ export function getListQuery(request: NextRequest): ListQuery {
   const page = Math.max(Number(params.get("page") ?? 1), 1)
   const limit = Math.min(Math.max(Number(params.get("limit") ?? 10), 1), 100)
   const sortOrder = params.get("sortOrder") === "asc" ? "asc" : "desc"
+  const requestedSort = params.get("sortBy")?.trim() || "createdAt"
+  const sortBy = ["createdAt", "name", "email", "role", "status"].includes(requestedSort)
+    ? requestedSort
+    : "createdAt"
 
   return {
     page,
@@ -29,7 +33,7 @@ export function getListQuery(request: NextRequest): ListQuery {
     status: params.get("status")?.trim() ?? "",
     role: params.get("role")?.trim() ?? "",
     type: params.get("type")?.trim() ?? "",
-    sortBy: params.get("sortBy")?.trim() || "createdAt",
+    sortBy,
     sortOrder,
   }
 }
@@ -44,4 +48,3 @@ export function paginationMeta(total: number, page: number, limit: number) {
     hasPreviousPage: page > 1,
   }
 }
-

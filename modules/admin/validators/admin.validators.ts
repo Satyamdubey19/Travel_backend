@@ -1,12 +1,15 @@
 const listingStatuses = new Set(["DRAFT", "PENDING_REVIEW", "ACTIVE", "PAUSED", "REJECTED", "ARCHIVED"])
-const kycStatuses = new Set(["PENDING", "APPROVED", "REJECTED", "NOT_SUBMITTED"])
 const payoutStatuses = new Set(["PENDING", "PROCESSING", "COMPLETED", "FAILED"])
 const accountStatuses = new Set(["ACTIVE", "SUSPENDED", "DELETED"])
 const bookingStatuses = new Set(["PENDING", "CONFIRMED", "CANCELLED", "COMPLETED", "NO_SHOW", "REFUND_PENDING"])
 
+function validationError(message: string) {
+  return Object.assign(new Error(message), { statusCode: 400 })
+}
+
 function readObject(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("Request body must be an object")
+    throw validationError("Request body must be an object")
   }
   return value as Record<string, unknown>
 }
@@ -29,12 +32,16 @@ export async function parseListingUpdate(request: Request) {
   const body = readObject(await request.json())
   const status = readString(body, "status")?.toUpperCase()
   if (status && !listingStatuses.has(status)) {
-    throw new Error("Invalid listing status")
+    throw validationError("Invalid listing status")
+  }
+  const reason = readString(body, "reason")
+  if (status && status !== "DRAFT" && (!reason || reason.length < 5)) {
+    throw validationError("A clear moderation reason of at least 5 characters is required")
   }
 
   return {
     status,
-    reason: readString(body, "reason"),
+    reason,
     isActive: typeof body.isActive === "boolean" ? body.isActive : undefined,
     title: readString(body, "title"),
     rooms: Array.isArray(body.rooms)
@@ -56,19 +63,15 @@ export async function parseListingUpdate(request: Request) {
 export async function parseKycDecision(request: Request) {
   const body = readObject(await request.json())
   const action = readString(body, "action")?.toLowerCase()
-  const status = readString(body, "status")?.toUpperCase()
-
   if (action && !["approve", "reject", "request_changes", "resubmission_required"].includes(action)) {
-    throw new Error("Invalid KYC action")
+    throw validationError("Invalid KYC action")
   }
-
-  if (status && !kycStatuses.has(status)) {
-    throw new Error("Invalid KYC status")
+  if (!action || body.status !== undefined) {
+    throw validationError("Use an explicit KYC action")
   }
 
   return {
     action,
-    status,
     rejectionReason: readString(body, "rejectionReason") || readString(body, "reason"),
   }
 }
@@ -77,7 +80,7 @@ export async function parsePayoutUpdate(request: Request) {
   const body = readObject(await request.json())
   const status = readString(body, "status")?.toUpperCase()
   if (!status || !payoutStatuses.has(status)) {
-    throw new Error("Invalid payout status")
+    throw validationError("Invalid payout status")
   }
 
   return {
@@ -92,7 +95,7 @@ export async function parseAccountUpdate(request: Request) {
   const body = readObject(await request.json())
   const status = readString(body, "status")?.toUpperCase()
   if (!status || !accountStatuses.has(status)) {
-    throw new Error("Invalid account status")
+    throw validationError("Invalid account status")
   }
 
   return {
@@ -105,7 +108,7 @@ export async function parseBookingUpdate(request: Request) {
   const body = readObject(await request.json())
   const status = readString(body, "status")?.toUpperCase()
   if (!status || !bookingStatuses.has(status)) {
-    throw new Error("Invalid booking status")
+    throw validationError("Invalid booking status")
   }
 
   return {

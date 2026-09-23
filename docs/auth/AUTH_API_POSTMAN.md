@@ -44,7 +44,7 @@ DATABASE_URL
 REDIS_URL recommended for shared rate limits, verification tokens, and refresh-token state
 JWT_ACCESS_SECRET or JWT_SECRET or NEXTAUTH_SECRET
 NEXTAUTH_URL=http://localhost:4000
-RESEND_API_KEY optional for email sending
+BREVO_API_KEY and BREVO_FROM_EMAIL required for verification and password-reset journeys
 GOOGLE_CLIENT_ID optional for Google OAuth
 GOOGLE_CLIENT_SECRET optional for Google OAuth
 ```
@@ -99,6 +99,9 @@ POST /api/auth/logout
 GET  /api/auth/verify?email=...&token=...
 POST /api/auth/forgot-password
 POST /api/auth/reset-password
+POST /api/auth/email-change/request
+POST /api/auth/email-change/confirm
+POST /api/auth/change-password
 GET  /api/auth/google-login
 GET  /api/auth/[...nextauth]
 POST /api/auth/[...nextauth]
@@ -126,7 +129,6 @@ Body:
 ```json
 {
   "name": "Rahul Sharma",
-  "email": "rahul.postman@example.com",
   "phone": "9000000001",
   "password": "secret123",
   "role": "user"
@@ -499,7 +501,6 @@ Body:
 ```json
 {
   "name": "Rahul S",
-  "email": "rahul.postman@example.com",
   "phone": "9000000001",
   "location": "Jaipur",
   "bio": "Testing profile update from Postman",
@@ -526,6 +527,8 @@ Expected status:
 ```text
 200 OK
 ```
+
+An email value different from the current account email is deliberately rejected here. Use the secured email-change request below instead of attempting a direct profile-email update.
 
 Expected response:
 
@@ -569,7 +572,6 @@ Body:
 ```json
 {
   "name": "Rahul S",
-  "email": "rahul.postman@example.com",
   "phone": "9000000001",
   "businessName": "Rahul Postman Travels",
   "activateHost": true
@@ -669,7 +671,7 @@ This prevents user email discovery.
 How to get reset token for testing:
 
 ```text
-If RESEND_API_KEY is configured, check the email inbox for the reset link.
+If BREVO_API_KEY and BREVO_FROM_EMAIL are configured with a verified Brevo sender, check the email inbox for the reset link.
 The reset link looks like:
 http://localhost:4000/reset-password?email=rahul.postman%40example.com&token=RAW_TOKEN
 Copy token from that URL.
@@ -755,7 +757,7 @@ Expected response:
 How to get verification token for testing:
 
 ```text
-If RESEND_API_KEY is configured, check the signup email.
+If BREVO_API_KEY and BREVO_FROM_EMAIL are configured with a verified Brevo sender, check the signup email.
 The verification link looks like:
 http://localhost:4000/api/auth/verify?token=RAW_TOKEN&email=rahul.postman%40example.com
 Copy email and token into Postman.
@@ -842,6 +844,60 @@ GET  /api/auth/me
 PATCH /api/auth/me
 POST /api/auth/logout
 ```
+
+## 15. Secure Email And Password Changes
+
+These endpoints require the normal authenticated cookie and a same-site `Origin` or `Referer`. For Postman, use the same `{{base_url}}` origin that set the cookie.
+
+### Request email change
+
+```text
+Method: POST
+URL: {{base_url}}/api/auth/email-change/request
+```
+
+```json
+{
+  "email": "new-address@example.com",
+  "password": "your-current-password"
+}
+```
+
+Expected status: `202 Accepted`.
+
+The current password prevents a stolen browser session from moving account recovery. A one-time, one-hour confirmation link is sent to the new address; the account email remains unchanged until that link is confirmed. The old address receives a security notice. Social/passwordless accounts cannot use this browser-password flow.
+
+### Confirm email change
+
+```text
+Method: POST
+URL: {{base_url}}/api/auth/email-change/confirm
+```
+
+```json
+{
+  "requestId": "uuid-from-email-link",
+  "token": "raw-token-from-email-link"
+}
+```
+
+Expected status: `200 OK`. The confirmation link is single-use. Success changes the email, updates the linked host contact email, revokes all sessions/devices and requires a new sign-in. Do not open this endpoint with `GET` or send it automatically from an email preview.
+
+### Change password while signed in
+
+```text
+Method: POST
+URL: {{base_url}}/api/auth/change-password
+```
+
+```json
+{
+  "currentPassword": "your-current-password",
+  "newPassword": "a-new-password-with-at-least-12-characters"
+}
+```
+
+Expected status: `200 OK`. The new password must differ from the current one. All active sessions and devices are revoked, so sign in again before testing another protected endpoint.
 
 ## Postman Collection Checklist
 
@@ -931,6 +987,10 @@ NEXTAUTH_SECRET=your-dev-secret
 
 Restart backend after editing `.env`.
 
+### Optimized production build reports `JWT_ACCESS_SECRET` missing
+
+Production validation intentionally requires the dedicated `JWT_ACCESS_SECRET`, even though local request handling can use the documented legacy JWT-secret fallback during a transition. Set a strong independent value in the deployment environment and keep it out of source control. The checked-in `.env.example` lists this required key; a local `.env` is not changed automatically by the application.
+
 ### `GET /api/auth/me` Returns 401 After Login
 
 Check:
@@ -957,9 +1017,9 @@ rahul.postman+1@example.com
 Check:
 
 ```text
-RESEND_API_KEY is configured.
-RESEND_FROM_EMAIL or EMAIL_FROM is valid.
-Backend logs do not show "Skipping auth email".
+BREVO_API_KEY is configured.
+BREVO_FROM_EMAIL is a verified Brevo sender/domain address.
+The endpoint must not return a success response if the mail provider is unavailable. Configure a valid `BREVO_API_KEY`; production also requires a verified `BREVO_FROM_EMAIL` sender.
 ```
 
 ### Google Login In Postman
