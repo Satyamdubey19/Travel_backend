@@ -65,7 +65,19 @@ export function requiredInProduction(name: string) {
   return value
 }
 
+export function isBuildPhase() {
+  return Boolean(
+    process.env.NEXT_PHASE === "phase-production-build" ||
+    process.env.npm_lifecycle_event === "build" ||
+    process.env.NEXT_BUILD === "true" ||
+    process.env.IS_BUILD === "true" ||
+    (typeof process.argv !== "undefined" &&
+      process.argv.some((arg) => typeof arg === "string" && (arg.includes("build") || arg.includes("next"))))
+  )
+}
+
 export function validateProductionEnvironment() {
   if (process.env.NODE_ENV !== "production") return
+  if (isBuildPhase()) return
   for (const name of productionRequiredEnvironmentVariables) requiredEnv(name)
 }

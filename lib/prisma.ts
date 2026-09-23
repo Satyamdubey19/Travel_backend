@@ -1,10 +1,17 @@
 import { PrismaPg } from "@prisma/adapter-pg"
 import { PrismaClient } from "@prisma/client"
 import { Pool } from "pg"
-import { requiredEnv, validateProductionEnvironment } from "@/lib/env"
+import { requiredEnv, validateProductionEnvironment, isBuildPhase } from "@/lib/env"
 
-validateProductionEnvironment()
-const connectionString = requiredEnv("DATABASE_URL")
+if (!isBuildPhase()) {
+  validateProductionEnvironment()
+}
+
+const connectionString =
+  process.env.DATABASE_URL ||
+  (process.env.NODE_ENV === "production" && !isBuildPhase()
+    ? requiredEnv("DATABASE_URL")
+    : "postgresql://postgres:postgres@localhost:5432/travelspro")
 
 const globalForPrisma = globalThis as typeof globalThis & {
   prisma?: PrismaClient
