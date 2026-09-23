@@ -1,6 +1,11 @@
 import type { NextAuthOptions } from "next-auth";
 import Google from "next-auth/providers/google";
 
+// Automatically ensure NEXTAUTH_URL points to public Vercel frontend URL so cookies & callbacks match
+if (!process.env.NEXTAUTH_URL || process.env.NEXTAUTH_URL.includes("onrender.com")) {
+  process.env.NEXTAUTH_URL = process.env.FRONTEND_URL || "https://rootly-mu.vercel.app";
+}
+
 const resolvedAuthSecret = process.env.NEXTAUTH_SECRET || process.env.JWT_SECRET || process.env.JWT_ACCESS_SECRET;
 if (!resolvedAuthSecret && process.env.NODE_ENV === "production") {
   throw new Error("NEXTAUTH_SECRET or JWT_SECRET is required in production");
