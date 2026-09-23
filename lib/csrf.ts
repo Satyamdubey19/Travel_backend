@@ -6,11 +6,29 @@ export function isTrustedMutationOrigin(request: Request) {
   if (!supplied) return false
   let origin: string
   try { origin = new URL(supplied).origin } catch { return false }
+
+  // Trust requests where origin matches the reverse proxy host (e.g. Vercel)
+  const forwardedHost = request.headers.get("x-forwarded-host")
+  const forwardedProto = request.headers.get("x-forwarded-proto") || "https"
+  if (forwardedHost) {
+    try {
+      const fOrigin = new URL(`${forwardedProto}://${forwardedHost}`).origin
+      if (origin === fOrigin) return true
+    } catch {}
+  }
+
+  // Trust any deployment on Vercel for this app
+  try {
+    const originHostname = new URL(origin).hostname
+    if (originHostname.endsWith(".vercel.app")) return true
+  } catch {}
+
   const allowed = [
     new URL(request.url).origin,
     process.env.NEXTAUTH_URL,
     process.env.FRONTEND_URL,
     process.env.CORS_ORIGIN,
+    "https://rootly-mu.vercel.app",
     ...(process.env.NODE_ENV !== "production" ? ["http://localhost:3000", "http://localhost:4000", "http://127.0.0.1:3000", "http://127.0.0.1:4000"] : []),
   ]
     .filter(Boolean)

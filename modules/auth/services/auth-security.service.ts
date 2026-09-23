@@ -97,11 +97,28 @@ export function assertTrustedOrigin(request: NextRequest) {
     return;
   }
 
+  // Trust requests where origin matches reverse proxy host (e.g. Vercel)
+  const forwardedHost = request.headers.get("x-forwarded-host");
+  const forwardedProto = request.headers.get("x-forwarded-proto") || "https";
+  if (forwardedHost) {
+    try {
+      const fOrigin = new URL(`${forwardedProto}://${forwardedHost}`).origin;
+      if (requestOrigin === fOrigin) return;
+    } catch {}
+  }
+
+  // Trust any deployment on Vercel for this app
+  try {
+    const originHostname = new URL(requestOrigin).hostname;
+    if (originHostname.endsWith(".vercel.app")) return;
+  } catch {}
+
   const allowedOrigins = [
     request.nextUrl.origin,
     process.env.NEXTAUTH_URL,
     process.env.CORS_ORIGIN,
     process.env.FRONTEND_URL,
+    "https://rootly-mu.vercel.app",
     "http://localhost:3000",
     "http://localhost:4000",
     "http://127.0.0.1:3000",
