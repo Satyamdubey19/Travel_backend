@@ -15,4 +15,7 @@ export interface UnifiedBookingRecord {
   location: string | null
   href: string
   paymentStatus: string | null
+  refundStatus?: string | null
+  refundAmount?: number
+  refundMessage?: string | null
 }

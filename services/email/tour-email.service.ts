@@ -1,7 +1,7 @@
 import { render } from "@react-email/render"
 import { Queue } from "bullmq"
 import IORedis from "ioredis"
-import { resend } from "@/lib/resend"
+import { sendBrevoEmail } from "@/lib/brevo"
 import TourTransactionalEmail from "@/emails/TourTransactionalEmail"
 import type { EmailJobName, EmailJobPayload } from "./email.types"
 
@@ -19,12 +19,11 @@ export async function sendTourEmailNow(name: EmailJobName, payload: EmailJobPayl
     ctaLabel: payload.ctaLabel,
   }))
 
-  return resend.emails.send({
-    from: process.env.RESEND_FROM_EMAIL ?? "GetHotels <onboarding@resend.dev>",
+  return sendBrevoEmail({
     to: payload.to,
     subject: payload.subject,
-    html,
-    tags: [{ name: "tour_event", value: name }],
+    htmlContent: html,
+    tags: [`tour_event:${name}`],
   })
 }
 

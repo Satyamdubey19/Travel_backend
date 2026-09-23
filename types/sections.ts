@@ -1,2 +1,2 @@
-export type CityFact = any
-export type WishlistPopup = any
+export type CityFact = { label: string; value: string }
+export type WishlistPopup = Record<string, unknown>

@@ -9,7 +9,7 @@ export const tourTravelerSchema = z.object({
   age: z.coerce.number().int().min(0).max(120).optional(),
   dob: z.string().optional(),
   aadhaar: z.string().trim().refine(isValidAadhaar, "Enter a valid 12-digit Aadhaar number"),
-  gender: z.string().trim().max(40).optional(),
+  gender: z.enum(["MALE", "FEMALE", "NON_BINARY", "PREFER_NOT_TO_SAY"]).optional(),
   email: z.string().email().optional().or(z.literal("")),
   phone: z.string().trim().min(6).max(30).optional().or(z.literal("")),
   emergencyContactName: z.string().trim().max(120).optional(),
@@ -36,6 +36,7 @@ export const createTourBookingIntentSchema = z.object({
   contactPhone: z.string().trim().min(6).max(30),
   specialRequests: z.string().trim().max(1000).optional(),
   idempotencyKey: z.string().trim().min(8).max(120).optional(),
+  riskAcknowledged: z.literal(true),
 })
 
 export const addTourTravelersSchema = z.object({

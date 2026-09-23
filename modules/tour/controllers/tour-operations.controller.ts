@@ -1,9 +1,7 @@
 import { NextRequest, NextResponse } from "next/server"
-import { cookies } from "next/headers"
-import { getServerSession } from "next-auth"
-import { authOptions } from "@/lib/auth"
-import { getUserFromSessionToken } from "@/modules/auth/services/auth.service"
-import { getHostByUserId } from "@/modules/host/services/host.service"
+import { requireHost } from "@/utils/host-auth"
+import { currentUserId } from "@/utils/user-auth"
+import { assertRateLimit, clientIp } from "@/lib/rate-limit"
 import {
   createTourAnnouncement,
   createTourBatch,
@@ -14,24 +12,13 @@ import {
   listTourDocuments,
 } from "@/modules/tour/services/tour-operations.service"
 
-async function getAuthenticatedUserId() {
-  const token = (await cookies()).get("token")?.value
-  if (token) {
-    const user = await getUserFromSessionToken(token)
-    if (user?.id) return String(user.id)
-  }
-
-  const session = await getServerSession(authOptions)
-  return session?.user?.id ? String(session.user.id) : null
-}
-
 async function getCurrentHost() {
-  const session = await getServerSession(authOptions)
-  if (!session?.user?.id) return null
-  return getHostByUserId(session.user.id)
+  try { return (await requireHost()).host }
+  catch { return null }
 }
 
 function statusFor(error: unknown) {
+  if (typeof error === "object" && error && "statusCode" in error) return Number((error as { statusCode?: number }).statusCode) || 500
   const message = error instanceof Error ? error.message : "Request failed"
   if (message.toLowerCase().includes("not found")) return 404
   if (message.toLowerCase().includes("required")) return 400
@@ -62,7 +49,7 @@ export async function createBatchController(req: NextRequest, tourId: string) {
 
 export async function joinWaitlistController(req: NextRequest, tourId: string) {
   try {
-    const userId = await getAuthenticatedUserId()
+    const userId = await currentUserId()
     if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
     const data = await joinTourWaitlist(userId, tourId, await req.json().catch(() => ({})))
     return NextResponse.json({ success: true, data }, { status: 201 })
@@ -74,7 +61,9 @@ export async function joinWaitlistController(req: NextRequest, tourId: string) {
 
 export async function listAnnouncementsController(_req: NextRequest, tourId: string) {
   try {
-    const data = await listTourAnnouncements(tourId)
+    const userId = await currentUserId()
+    if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+    const data = await listTourAnnouncements(userId, tourId)
     return NextResponse.json({ data })
   } catch (error) {
     const message = error instanceof Error ? error.message : "Could not load announcements"
@@ -86,6 +75,7 @@ export async function createAnnouncementController(req: NextRequest, tourId: str
   try {
     const host = await getCurrentHost()
     if (!host) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+    await assertRateLimit(`tour:announcement:${host.id}:${clientIp(req)}`, 12, 60 * 60)
     const data = await createTourAnnouncement(host.id, tourId, await req.json().catch(() => ({})))
     return NextResponse.json({ data }, { status: 201 })
   } catch (error) {
@@ -96,8 +86,9 @@ export async function createAnnouncementController(req: NextRequest, tourId: str
 
 export async function listDocumentsController(req: NextRequest, tourId: string) {
   try {
-    const participantOnly = new URL(req.url).searchParams.get("scope") === "participant"
-    const data = await listTourDocuments(tourId, participantOnly)
+    const userId = await currentUserId()
+    if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+    const data = await listTourDocuments(userId, tourId)
     return NextResponse.json({ data })
   } catch (error) {
     const message = error instanceof Error ? error.message : "Could not load documents"

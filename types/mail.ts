@@ -1,4 +1,4 @@
-export type AuthMailType = "signup" | "login" | "reset";
+export type AuthMailType = "signup" | "login" | "reset" | "email_change" | "email_change_notice";
 
 export interface AuthMailInput {
   to: string;

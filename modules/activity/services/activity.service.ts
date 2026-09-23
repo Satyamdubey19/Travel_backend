@@ -1,5 +1,5 @@
 import { prisma } from "@/lib/prisma"
-import type { ActivityCategory, ActivityDifficulty, ListingStatus } from "@prisma/client"
+import type { ActivityCategory, ActivityDifficulty, ListingStatus, Activity as PrismaActivity } from "@prisma/client"
 import type { Activity } from "@/lib/activities"
 
 // ─── Input Types ───────────────────────────────────────────────────────────────
@@ -50,12 +50,15 @@ export async function getActivityById(id: string, hostId: string) {
 }
 
 export async function listPublicActivities() {
+  const tomorrow = new Date()
+  tomorrow.setHours(0, 0, 0, 0)
+  tomorrow.setDate(tomorrow.getDate() + 1)
   const activities = await prisma.activity.findMany({
-    where: { status: "ACTIVE", isActive: true },
+    where: { status: "ACTIVE", isActive: true, isApproved: true, Host: { is: { isActive: true, isApproved: true, isVerified: true } }, ActivitySlot: { some: { isActive: true, date: { gte: tomorrow } } } },
     include: {
       Host: true,
       ActivitySlot: {
-        where: { isActive: true },
+        where: { isActive: true, date: { gte: tomorrow } },
         orderBy: [{ date: "asc" }, { startTime: "asc" }],
       },
       _count: { select: { ActivityBooking: true, Review: true } },
@@ -67,16 +70,22 @@ export async function listPublicActivities() {
 }
 
 export async function getPublicActivityBySlug(slug: string) {
+  const tomorrow = new Date()
+  tomorrow.setHours(0, 0, 0, 0)
+  tomorrow.setDate(tomorrow.getDate() + 1)
   const activity = await prisma.activity.findFirst({
     where: {
       OR: [{ slug }, { id: slug }],
       status: "ACTIVE",
       isActive: true,
+      isApproved: true,
+      Host: { is: { isActive: true, isApproved: true, isVerified: true } },
+      ActivitySlot: { some: { isActive: true, date: { gte: tomorrow } } },
     },
     include: {
       Host: true,
       ActivitySlot: {
-        where: { isActive: true },
+        where: { isActive: true, date: { gte: tomorrow } },
         orderBy: [{ date: "asc" }, { startTime: "asc" }],
       },
       _count: { select: { ActivityBooking: true, Review: true } },
@@ -86,7 +95,11 @@ export async function getPublicActivityBySlug(slug: string) {
   return activity ? normalizeActivityForPublic(activity) : null
 }
 
-export type ActivityRecord = any
+export type ActivityRecord = PrismaActivity & {
+  Host?: { businessName: string | null; isVerified: boolean } | null
+  ActivitySlot?: Array<{ startTime: string }>
+  _count?: { Review: number; ActivityBooking?: number }
+}
 
 export function normalizeActivityForForm(activity: ActivityRecord) {
   return {
@@ -124,8 +137,9 @@ type PublicActivityRecord = {
   difficulty: string
   highlights: string[]
   included: string[]
+  cancellationPolicy: string | null
   Host?: { businessName: string | null; isVerified: boolean }
-  ActivitySlot?: { startTime: string }[]
+  ActivitySlot?: { id: string; date: Date; startTime: string; totalSpots: number; bookedSpots: number }[]
   _count?: { ActivityBooking: number; Review: number }
 }
 
@@ -134,6 +148,8 @@ export function normalizeActivityForPublic(activity: PublicActivityRecord): Acti
   const category = activity.category.toLowerCase() as Activity["category"]
   const difficulty = titleCase(activity.difficulty) as Activity["difficulty"]
   const startTimes = Array.from(new Set((activity.ActivitySlot ?? []).map((slot) => slot.startTime)))
+  const totalFutureSpots = (activity.ActivitySlot ?? []).reduce((sum, slot) => sum + slot.totalSpots, 0)
+  const availableFutureSpots = (activity.ActivitySlot ?? []).reduce((sum, slot) => sum + Math.max(slot.totalSpots - slot.bookedSpots, 0), 0)
 
   return {
     slug: activity.slug,
@@ -147,17 +163,24 @@ export function normalizeActivityForPublic(activity: PublicActivityRecord): Acti
     duration: activity.duration,
     rating: activity.averageRating,
     reviews: activity.totalReviews || activity._count?.Review || 0,
-    groupSize: `${Math.max(0, activity.availableSlots)} of ${activity.totalSlots} slots available`,
-    startTimes: startTimes.length > 0 ? startTimes : ["9:00 AM"],
+    groupSize: totalFutureSpots > 0 ? `${availableFutureSpots} of ${totalFutureSpots} future spots available` : "No future slots",
+    startTimes,
+    slots: (activity.ActivitySlot ?? []).map((slot) => ({
+      id: slot.id,
+      date: slot.date.toISOString(),
+      startTime: slot.startTime,
+      spotsLeft: Math.max(slot.totalSpots - slot.bookedSpots, 0),
+    })),
     language: activity.language,
     difficulty,
     highlights: activity.highlights,
     included: activity.included,
-    itinerary: activity.highlights.length > 0 ? activity.highlights : ["Meet host", "Activity briefing", "Experience starts"],
+    itinerary: activity.highlights,
+    cancellationPolicy: activity.cancellationPolicy,
     host: {
       name: activity.Host?.businessName || "GetHotels activity host",
       verified: activity.Host?.isVerified ?? false,
-      responseTime: "Replies in 10 min",
+      responseTime: "Response time not measured",
     },
   }
 }
@@ -167,6 +190,7 @@ function titleCase(value: string) {
 }
 
 export async function createActivity(hostId: string, data: ActivityInput) {
+  validateActivityListing(data)
   const totalSlots = parseInt(data.totalSlots ?? data.groupSizeMax ?? "20") || 20
   const availableSlots = Math.min(parseInt(data.availableSlots ?? String(totalSlots)) || totalSlots, totalSlots)
 
@@ -199,12 +223,15 @@ export async function createActivity(hostId: string, data: ActivityInput) {
       meetingLat: data.meetingLat ? parseFloat(data.meetingLat) : null,
       meetingLng: data.meetingLng ? parseFloat(data.meetingLng) : null,
       cancellationPolicy: data.cancellationPolicy || null,
-      status: (data.status || "PENDING_REVIEW") as ListingStatus,
+      status: "PENDING_REVIEW" as ListingStatus,
+      isApproved: false,
+      submittedForReviewAt: new Date(),
     },
   })
 }
 
 export async function updateActivity(id: string, data: ActivityInput) {
+  validateActivityListing(data)
   const totalSlots = parseInt(data.totalSlots ?? data.groupSizeMax ?? "20") || 20
   const availableSlots = Math.min(parseInt(data.availableSlots ?? String(totalSlots)) || totalSlots, totalSlots)
 
@@ -237,11 +264,33 @@ export async function updateActivity(id: string, data: ActivityInput) {
       meetingLat: data.meetingLat ? parseFloat(data.meetingLat) : null,
       meetingLng: data.meetingLng ? parseFloat(data.meetingLng) : null,
       cancellationPolicy: data.cancellationPolicy || null,
-      status: (data.status || "PENDING_REVIEW") as ListingStatus,
+      status: "PENDING_REVIEW" as ListingStatus,
+      isApproved: false,
+      approvedAt: null,
+      submittedForReviewAt: new Date(),
     },
   })
 }
 
 export async function deleteActivity(id: string) {
-  return prisma.activity.delete({ where: { id } })
+  return prisma.activity.update({ where: { id }, data: { status: "ARCHIVED", isActive: false, isApproved: false, archivedAt: new Date() } })
+}
+
+function validateActivityListing(data: ActivityInput) {
+  const invalid = (message: string) => { throw Object.assign(new Error(message), { statusCode: 400 }) }
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(data.slug?.trim() || "")) invalid("Activity slug must use lowercase words separated by hyphens")
+  if ((data.title?.trim().length || 0) < 5) invalid("Activity title must be at least 5 characters")
+  if ((data.description?.trim().length || 0) < 40) invalid("Activity description must be at least 40 characters")
+  if ((data.city?.trim().length || 0) < 2) invalid("Activity city is required")
+  if (!["ADVENTURE", "WELLNESS", "HERITAGE", "WATER", "FOOD", "CULTURE", "NATURE", "SPORTS"].includes(data.category || "ADVENTURE")) invalid("Activity category is invalid")
+  if (!["EASY", "MODERATE", "HIGH"].includes(data.difficulty || "EASY")) invalid("Activity difficulty is invalid")
+  if (!Number.isFinite(Number(data.price)) || Number(data.price) <= 0) invalid("Activity price must be greater than zero")
+  const minimum = Number(data.groupSizeMin ?? 1)
+  const maximum = Number(data.groupSizeMax ?? 20)
+  const total = Number(data.totalSlots ?? maximum)
+  const available = Number(data.availableSlots ?? total)
+  if (!Number.isInteger(minimum) || minimum < 1 || !Number.isInteger(maximum) || maximum < minimum || maximum > 100) invalid("Activity group size is invalid")
+  if (!Number.isInteger(total) || total < 1 || total > maximum || !Number.isInteger(available) || available < 0 || available > total) invalid("Activity capacity is invalid")
+  if (!data.images?.some((image) => image.trim())) invalid("At least one activity image is required")
+  if ((data.cancellationPolicy?.trim().length || 0) < 20) invalid("A clear cancellation policy of at least 20 characters is required")
 }

@@ -1,13 +1,12 @@
-import { resend } from "@/lib/resend";
+import { BrevoEmailError, sendBrevoEmail } from "@/lib/brevo";
+import {
+  assertAuthEmailDeliveryConfigured,
+  authEmailDeliveryFailure,
+} from "@/lib/auth-email-policy";
 import type { AuthMailContent, AuthMailInput } from "@/types/mail";
 
-const appName = "GetHotels";
+const appName = "Travels Pro";
 const appUrl = process.env.NEXTAUTH_URL ?? "http://localhost:3000";
-const fromEmail =
-  process.env.RESEND_FROM_EMAIL ??
-  process.env.EMAIL_FROM ??
-  "GetHotels <onboarding@resend.dev>";
-
 function escapeHtml(value: string) {
   return value
     .replace(/&/g, "&amp;")
@@ -44,6 +43,32 @@ function getAuthMailContent({ name, type, actionUrl }: AuthMailInput): AuthMailC
       note: "If this was not you, you can safely ignore this email. Your password will not change unless you use the link.",
       ctaLabel: "Reset password",
       text: `Hello ${plainName}, reset your GetHotels password here: ${actionUrl ?? appUrl}`,
+    };
+  }
+
+  if (type === "email_change") {
+    return {
+      subject: `Confirm your new ${appName} email`,
+      preview: "Confirm your new email address before it replaces your current sign-in email.",
+      greeting: `Hello ${safeName},`,
+      heading: "Confirm your new email",
+      body: "A request was made to use this address for your Travels Pro account. Confirm it only if you started the change after entering your current password.",
+      note: "For your security, confirming the new address signs every device out. You will sign in again with the new address.",
+      ctaLabel: "Confirm new email",
+      text: `Hello ${plainName}, confirm your new ${appName} email: ${actionUrl ?? appUrl}`,
+    };
+  }
+
+  if (type === "email_change_notice") {
+    return {
+      subject: `${appName} email-change request`,
+      preview: "A request is waiting for confirmation at a new email address.",
+      greeting: `Hello ${safeName},`,
+      heading: "Email change requested",
+      body: "A request was made to change the email address on your Travels Pro account. No change has happened yet: the new address must be confirmed first.",
+      note: "If this was not you, reset your password and review your active devices immediately.",
+      ctaLabel: "Review account security",
+      text: `Hello ${plainName}, an email change was requested for your ${appName} account. If this was not you, reset your password: ${appUrl}/forgot-password`,
     };
   }
 
@@ -174,6 +199,13 @@ type BookingConfirmationInput = {
   bookingUrl?: string;
 };
 
+type NotificationEmailInput = {
+  deliveryId: string;
+  to: string;
+  name?: string | null;
+  title: string;
+};
+
 function formatMoney(value: unknown, currency = "INR") {
   const amount = Number(value ?? 0);
   return new Intl.NumberFormat("en-IN", {
@@ -270,34 +302,80 @@ function buildBookingConfirmationHtml(input: BookingConfirmationInput) {
 }
 
 export async function sendAuthEmail(input: AuthMailInput) {
-  if (!process.env.RESEND_API_KEY) {
-    console.warn("RESEND_API_KEY is not set. Skipping auth email.");
-    return;
-  }
+  assertAuthEmailDeliveryConfigured();
 
   const content = getAuthMailContent(input);
 
-  await resend.emails.send({
-    from: fromEmail,
-    to: input.to,
-    subject: content.subject,
-    text: content.text,
-    html: buildAuthEmailHtml(content, input.actionUrl),
-  });
+  try {
+    await sendBrevoEmail({
+      to: { email: input.to, ...(input.name ? { name: input.name } : {}) },
+      subject: content.subject,
+      textContent: content.text,
+      htmlContent: buildAuthEmailHtml(content, input.actionUrl),
+    });
+  } catch (error) {
+    // Keep provider details out of the client response and logs. A bounded
+    // status/code is enough to distinguish configuration from provider
+    // acceptance during local troubleshooting without exposing an address or
+    // secret-bearing response text.
+    const providerError = error instanceof BrevoEmailError ? error : undefined;
+    console.error("Auth email provider rejected delivery", {
+      name: providerError?.name ?? "ProviderError",
+      code: providerError?.providerCode,
+      statusCode: providerError?.providerStatus,
+    });
+    throw authEmailDeliveryFailure();
+  }
 }
 
 export async function sendBookingConfirmationEmail(input: BookingConfirmationInput) {
-  if (!process.env.RESEND_API_KEY) {
-    console.warn("RESEND_API_KEY is not set. Skipping booking confirmation email.");
+  if (!process.env.BREVO_API_KEY || !process.env.BREVO_FROM_EMAIL) {
+    console.warn("BREVO_API_KEY or BREVO_FROM_EMAIL is not set. Skipping booking confirmation email.");
     return;
   }
 
-  await resend.emails.send({
-    from: fromEmail,
+  await sendBrevoEmail({
     to: input.to,
     subject: `Booking ${input.bookingCode} for ${input.listingName}`,
-    text: `Hello ${input.guestName || "there"}, your booking hold ${input.bookingCode} for ${input.listingName} is created for ${formatStayDate(input.checkIn)} to ${formatStayDate(input.checkOut)}. Total: ${formatMoney(input.totalAmount, input.currency ?? "INR")}.`,
-    html: buildBookingConfirmationHtml(input),
+    textContent: `Hello ${input.guestName || "there"}, your booking hold ${input.bookingCode} for ${input.listingName} is created for ${formatStayDate(input.checkIn)} to ${formatStayDate(input.checkOut)}. Total: ${formatMoney(input.totalAmount, input.currency ?? "INR")}.`,
+    htmlContent: buildBookingConfirmationHtml(input),
+  });
+}
+
+export async function sendNotificationEmail(input: NotificationEmailInput) {
+  if (!process.env.BREVO_API_KEY || !process.env.BREVO_FROM_EMAIL) {
+    throw new Error("Notification email provider is not configured");
+  }
+
+  const safeName = escapeHtml(input.name?.trim() || "there");
+  const plainTitle = input.title.replace(/[\r\n]+/g, " ").trim().slice(0, 140) || "Account update";
+  const safeTitle = escapeHtml(plainTitle);
+  const safeAppUrl = escapeHtml(appUrl);
+
+  await sendBrevoEmail({
+    to: input.to,
+    subject: `${appName}: ${plainTitle}`,
+    textContent: `Hello ${input.name?.trim() || "there"}, you have a new GetHotels update: ${plainTitle}. Sign in securely to view the details: ${appUrl}`,
+    htmlContent: `
+      <div style="margin:0;background:#f4f7fb;padding:32px 16px;font-family:Arial,Helvetica,sans-serif;color:#0f172a">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:600px;margin:0 auto">
+          <tr><td style="overflow:hidden;border:1px solid #dbe3ef;border-radius:24px;background:#ffffff;box-shadow:0 24px 70px rgba(15,23,42,0.08)">
+            <div style="background:linear-gradient(135deg,#0f172a 0%,#4338ca 56%,#22d3ee 100%);padding:32px;color:#ffffff">
+              <div style="font-size:12px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:rgba(255,255,255,.75)">Secure account update</div>
+              <h1 style="margin:14px 0 0;font-size:28px;line-height:1.2">${safeTitle}</h1>
+            </div>
+            <div style="padding:32px">
+              <p style="margin:0 0 12px;font-size:18px;font-weight:700">Hello ${safeName},</p>
+              <p style="margin:0 0 24px;font-size:15px;line-height:1.7;color:#475569">A new update is waiting in your GetHotels account. For your privacy, sensitive booking, payment, identity, and dispute details are never included in this email.</p>
+              <a href="${safeAppUrl}" style="display:inline-block;border-radius:14px;background:#0f172a;color:#ffffff;padding:14px 22px;font-size:15px;font-weight:800;text-decoration:none">Sign in securely</a>
+              <p style="margin:22px 0 0;font-size:12px;line-height:1.6;color:#94a3b8">Open GetHotels directly if you are unsure about a link. We will never ask for your password or OTP by email.</p>
+            </div>
+          </td></tr>
+        </table>
+      </div>
+    `,
+    tags: [`notification:${input.deliveryId}`],
+    headers: { idempotencyKey: input.deliveryId },
   });
 }
 

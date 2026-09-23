@@ -5,6 +5,8 @@ Remediation update: 2026-06-14
 Target base URL: `http://localhost:4000`  
 Scope: auth endpoints, JWT cookies, NextAuth integration, role behavior, password reset, email verification, CSRF, user enumeration, and race conditions.
 
+> Historical audit. For the current implementation and release decision, use [`AUTH_CURRENT_RELEASE_GATE.md`](./AUTH_CURRENT_RELEASE_GATE.md). New custom access tokens now carry a persisted session claim; several findings below describe pre-remediation behavior and are retained for audit history.
+
 This report assumes the tester is a malicious user with normal internet access and no database access unless explicitly stated for setup.
 
 ## Remediation Status
@@ -972,4 +974,4 @@ replace-device deactivates selected device and logs in current device
 
 ## Final Assessment
 
-The auth module is stronger after remediation. Direct host/admin privilege escalation, unverified login, reset-token replay, stale middleware token access, and no-Origin mutation attempts are now blocked by the current implementation. Redis now covers rate limits, email verification-token storage, and refresh-token state when REDIS_URL is configured. The remaining operational weakness is JWT access-token revocation/session invalidation, which is still process-memory based and should be persisted before multi-instance production use.
+The auth module is stronger after remediation. Direct host/admin privilege escalation, unverified login, reset-token replay, stale middleware token access, and no-Origin mutation attempts are now blocked by the current implementation. Redis now covers rate limits, email verification-token storage, and refresh-token state when `REDIS_URL` is configured. New custom JWT access tokens are also bound to the persisted `Session.id` and device, so logout is enforced across processes; legacy tokens without that claim remain a short-lived compatibility limitation until expiry.

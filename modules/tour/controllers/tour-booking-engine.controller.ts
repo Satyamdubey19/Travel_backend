@@ -1,22 +1,9 @@
 import { NextRequest, NextResponse } from "next/server"
-import { cookies } from "next/headers"
-import { getServerSession } from "next-auth"
-import { authOptions } from "@/lib/auth"
-import { getUserFromSessionToken } from "@/modules/auth/services/auth.service"
+import { currentUserId } from "@/utils/user-auth"
 import { addTravelersToTourBooking, cancelTourBooking, createTourBookingIntent } from "@/modules/tour/services/tour-booking-engine.service"
 import { validateTravelerForTour } from "@/modules/tour/services/tour-traveler-duplicate.service"
 import { addTourTravelersSchema, cancelTourBookingSchema, createTourBookingIntentSchema, validateTourTravelerSchema } from "@/modules/tour/validators/tour-booking.validators"
 import { assertRateLimit, clientIp } from "@/lib/rate-limit"
-
-async function getAuthenticatedUserId() {
-  const token = (await cookies()).get("token")?.value
-  if (token) {
-    const user = await getUserFromSessionToken(token)
-    if (user?.id) return String(user.id)
-  }
-  const session = await getServerSession(authOptions)
-  return session?.user?.id ? String(session.user.id) : null
-}
 
 function apiError(error: unknown, fallback: string) {
   const message = error instanceof Error ? error.message : fallback
@@ -26,7 +13,7 @@ function apiError(error: unknown, fallback: string) {
 
 export async function createTourBookingIntentController(req: NextRequest, tourId: string) {
   try {
-    const userId = await getAuthenticatedUserId()
+    const userId = await currentUserId()
     if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
     await assertRateLimit(`tour-booking:${userId}:${clientIp(req)}`, 10, 60)
     const body = createTourBookingIntentSchema.parse(await req.json())
@@ -39,7 +26,7 @@ export async function createTourBookingIntentController(req: NextRequest, tourId
 
 export async function addTourTravelersController(req: NextRequest, bookingId: string) {
   try {
-    const userId = await getAuthenticatedUserId()
+    const userId = await currentUserId()
     if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
     await assertRateLimit(`tour-travelers:${userId}:${clientIp(req)}`, 20, 60)
     const body = addTourTravelersSchema.parse(await req.json())
@@ -52,7 +39,7 @@ export async function addTourTravelersController(req: NextRequest, bookingId: st
 
 export async function cancelTourBookingController(req: NextRequest, bookingId: string) {
   try {
-    const userId = await getAuthenticatedUserId()
+    const userId = await currentUserId()
     if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
     await assertRateLimit(`tour-cancel:${userId}:${clientIp(req)}`, 10, 60)
     const body = cancelTourBookingSchema.parse(await req.json().catch(() => ({})))
@@ -65,7 +52,7 @@ export async function cancelTourBookingController(req: NextRequest, bookingId: s
 
 export async function validateTourTravelerController(req: NextRequest, tourId: string) {
   try {
-    const userId = await getAuthenticatedUserId()
+    const userId = await currentUserId()
     if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
     await assertRateLimit(`tour-traveler-validate:${userId}:${clientIp(req)}`, 60, 60)
     const body = validateTourTravelerSchema.parse(await req.json())

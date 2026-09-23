@@ -17,6 +17,21 @@ TOURS.md
 TOUR_BOOKING.md
   Tour booking intent, travelers, cancellation, payment order, payment verification, duplicate traveler checks.
 
+ACTIVITY_BOOKING.md
+  Dated activity inventory, idempotent seat holds, payment, expiry, cancellation/refund review and verified reviews.
+
+RENTAL_BOOKING.md
+  Date-overlap rental inventory, idempotent holds, payment, expiry, cancellation/refund review and verified reviews.
+
+REVIEWS.md
+  Booking-linked reviews, public visibility, host responses, admin moderation and aggregate repair.
+
+INCIDENTS.md
+  Private booking-bound tour incident reporting, ordered admin triage, audited restrictions and emergency-service boundary.
+
+COMMUNITY_SAFETY.md
+  Trip Circle message reporting, user blocking, symmetric message visibility and audited admin moderation.
+
 HOST.md
   Host onboarding, host authorization expectations, and host-related route ownership.
 
@@ -27,7 +42,7 @@ WISHLIST.md
   Wishlist list, add, and remove flows.
 
 NOTIFICATIONS.md
-  Notification services, real-time gateway responsibilities, queues, and event fanout.
+  Ownership-scoped inbox, transactional email outbox, retry/dead-letter worker, privacy boundary, and remaining real-time work.
 
 UTILITY.md
   Uploads, location, AI, and legacy alias endpoints.

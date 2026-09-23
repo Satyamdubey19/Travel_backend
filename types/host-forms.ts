@@ -1,6 +1,6 @@
-export type HostFormSectionCardProps = any
-export type RoomEntry = any
-export type TravelListingFormData = any
-export type ItineraryDay = any
-export type TourForm = any
-export type DynamicListProps = any
+export type HostFormSectionCardProps = Record<string, unknown>
+export type RoomEntry = Record<string, unknown>
+export type TravelListingFormData = Record<string, unknown>
+export type ItineraryDay = Record<string, unknown>
+export type TourForm = Record<string, unknown>
+export type DynamicListProps = Record<string, unknown>

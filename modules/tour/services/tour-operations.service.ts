@@ -1,5 +1,7 @@
 import { Prisma } from "@prisma/client"
 import { prisma } from "@/lib/prisma"
+import { queueNotification } from "@/modules/notification/services/notification-outbox.service"
+import { requireTourCircleAccess } from "./tour-circle-access.service"
 
 export type TourBatch = {
   id: string
@@ -143,39 +145,40 @@ export async function joinTourWaitlist(userId: string, tourKey: string, input: {
 
   const batchId = input.batchId?.startsWith("tour:") ? null : input.batchId ?? null
   const seatsRequested = Math.max(1, Math.min(10, Math.trunc(Number(input.seatsRequested ?? 1))))
-  const positionRow = await prisma.$queryRaw<{ nextPosition: number }[]>`
-    SELECT COALESCE(MAX("position"), 0) + 1 AS "nextPosition"
-    FROM "TourWaitlist"
-    WHERE "tourId" = ${tour.id} AND "status" = 'WAITING'
-  `
-  const position = Number(positionRow[0]?.nextPosition ?? 1)
+  return prisma.$transaction(async (tx) => {
+    const positionRow = await tx.$queryRaw<{ nextPosition: number }[]>`
+      SELECT COALESCE(MAX("position"), 0) + 1 AS "nextPosition"
+      FROM "TourWaitlist"
+      WHERE "tourId" = ${tour.id} AND "status" = 'WAITING'
+    `
+    const position = Number(positionRow[0]?.nextPosition ?? 1)
 
-  const rows = await prisma.$queryRaw<Record<string, unknown>[]>`
-    INSERT INTO "TourWaitlist" ("userId", "tourId", "batchId", "position", "seatsRequested", "status", "expiresAt")
-    VALUES (${userId}, ${tour.id}, ${batchId}, ${position}, ${seatsRequested}, 'WAITING', ${new Date(Date.now() + 1000 * 60 * 60 * 24 * 7)})
-    ON CONFLICT ("userId", "tourId", (COALESCE("batchId", 'tour'))) DO UPDATE SET
-      "seatsRequested" = EXCLUDED."seatsRequested",
-      "status" = 'WAITING',
-      "expiresAt" = EXCLUDED."expiresAt"
-    RETURNING *
-  `
+    const rows = await tx.$queryRaw<Record<string, unknown>[]>`
+      INSERT INTO "TourWaitlist" ("userId", "tourId", "batchId", "position", "seatsRequested", "status", "expiresAt")
+      VALUES (${userId}, ${tour.id}, ${batchId}, ${position}, ${seatsRequested}, 'WAITING', ${new Date(Date.now() + 1000 * 60 * 60 * 24 * 7)})
+      ON CONFLICT ("userId", "tourId", (COALESCE("batchId", 'tour'))) DO UPDATE SET
+        "seatsRequested" = EXCLUDED."seatsRequested",
+        "status" = 'WAITING',
+        "expiresAt" = EXCLUDED."expiresAt"
+      RETURNING *
+    `
 
-  await prisma.notification.create({
-    data: {
-      userId,
-      type: "SYSTEM",
-      title: "You joined the waitlist",
-      message: `We will notify you if seats open for ${tour.title}.`,
-      data: { tourId: tour.id, batchId, seatsRequested },
-    },
-  }).catch(() => null)
+    await queueNotification(tx, {
+      data: {
+        userId,
+        type: "SYSTEM",
+        title: "You joined the waitlist",
+        message: `We will notify you if seats open for ${tour.title}.`,
+        data: { tourId: tour.id, batchId, seatsRequested },
+      },
+    })
 
-  return rows[0]
+    return rows[0]
+  })
 }
 
-export async function listTourAnnouncements(tourKey: string) {
-  const tour = await findTour(tourKey)
-  if (!tour) throw new Error("Tour not found")
+export async function listTourAnnouncements(userId: string, tourKey: string) {
+  const { tour } = await requireTourCircleAccess(userId, tourKey, { allowCompletedTour: true })
   return prisma.$queryRaw`
     SELECT * FROM "TourAnnouncement"
     WHERE "tourId" = ${tour.id}
@@ -188,22 +191,28 @@ export async function createTourAnnouncement(hostId: string, tourKey: string, in
   const tour = await findTour(tourKey)
   if (!tour || tour.hostId !== hostId) throw new Error("Tour not found")
   if (!input.title?.trim() || !input.message?.trim()) throw new Error("Announcement title and message are required")
+  const title = input.title.trim()
+  const message = input.message.trim()
+  if (title.length > 120) throw new Error("Announcement title must not exceed 120 characters")
+  if (message.length > 2000) throw new Error("Announcement message must not exceed 2000 characters")
+  const severity = ["INFO", "IMPORTANT", "URGENT"].includes(String(input.severity).toUpperCase())
+    ? String(input.severity).toUpperCase()
+    : "INFO"
 
   const rows = await prisma.$queryRaw<Record<string, unknown>[]>`
     INSERT INTO "TourAnnouncement" ("tourId", "hostId", "title", "message", "severity", "isPinned")
-    VALUES (${tour.id}, ${hostId}, ${input.title.trim()}, ${input.message.trim()}, ${input.severity ?? "INFO"}, ${Boolean(input.isPinned)})
+    VALUES (${tour.id}, ${hostId}, ${title}, ${message}, ${severity}, ${Boolean(input.isPinned)})
     RETURNING *
   `
   return rows[0]
 }
 
-export async function listTourDocuments(tourKey: string, participantOnly = false) {
-  const tour = await findTour(tourKey)
-  if (!tour) throw new Error("Tour not found")
+export async function listTourDocuments(userId: string, tourKey: string) {
+  const { tour, isHost } = await requireTourCircleAccess(userId, tourKey, { allowCompletedTour: true })
   return prisma.$queryRaw`
     SELECT * FROM "TourDocument"
     WHERE "tourId" = ${tour.id}
-    AND (${participantOnly} = false OR "visibility" IN ('PUBLIC', 'PARTICIPANTS'))
+    AND (${isHost} = true OR "visibility" IN ('PUBLIC', 'PARTICIPANTS'))
     ORDER BY "createdAt" DESC
   `
 }

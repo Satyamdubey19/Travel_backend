@@ -1,5 +1,5 @@
 import { prisma } from "@/lib/prisma"
-import type { VehicleType, ListingStatus, TransmissionType, FuelType } from "@prisma/client"
+import type { VehicleType, ListingStatus, TransmissionType, FuelType, Prisma, Rental as PrismaRental } from "@prisma/client"
 import type { Rental } from "@/lib/rentals"
 
 
@@ -55,7 +55,7 @@ export async function getRentalById(id: string, hostId: string) {
 
 export async function listPublicRentals() {
   const rentals = await prisma.rental.findMany({
-    where: { status: "ACTIVE", isActive: true },
+    where: { status: "ACTIVE", isActive: true, isApproved: true, Host: { is: { isActive: true, isApproved: true, isVerified: true } } },
     include: {
       Host: true,
       RentalDetails: true,
@@ -73,6 +73,8 @@ export async function getPublicRentalBySlug(slug: string) {
       OR: [{ slug }, { id: slug }],
       status: "ACTIVE",
       isActive: true,
+      isApproved: true,
+      Host: { is: { isActive: true, isApproved: true, isVerified: true } },
     },
     include: {
       Host: true,
@@ -84,7 +86,11 @@ export async function getPublicRentalBySlug(slug: string) {
   return rental ? normalizeRentalForPublic(rental) : null
 }
 
-export type RentalWithRelations = any
+export type RentalWithRelations = PrismaRental & {
+  Host?: { businessName: string | null; isVerified: boolean } | null
+  RentalDetails?: { transmission: TransmissionType | null; fuelType: FuelType | null; seats: number | null; engine: string | null; rangeKm: number | null; deposit: Prisma.Decimal | null; features: string[]; documentsRequired: string[] } | null
+  _count?: { Review: number; RentalBooking?: number }
+}
 
 export function normalizeRentalForForm(rental: RentalWithRelations) {
   return {
@@ -162,12 +168,12 @@ export function normalizeRentalForPublic(rental: PublicRentalRecord): Rental {
     availableUnits: rental.availableUnits,
     totalUnits: rental.totalUnits,
     deposit: details?.deposit != null ? Number(details.deposit) : 0,
-    cancellation: rental.cancellationPolicy || "Free cancellation before pickup day",
+    cancellation: rental.cancellationPolicy || "",
     features: details?.features ?? [],
     documents: details?.documentsRequired ?? [],
     vendor: {
       name: rental.Host?.businessName || "GetHotels rental partner",
-      responseTime: "Usually replies in 10 min",
+      responseTime: "Response time not measured",
       verified: rental.Host?.isVerified ?? false,
     },
   }
@@ -207,7 +213,9 @@ export async function createRental(
         pricePerDay: parseFloat(rentalData.pricePerDay) || 0,
         originalPrice: rentalData.originalPrice ? parseFloat(rentalData.originalPrice) : null,
         cancellationPolicy: rentalData.cancellationPolicy || null,
-        status: (rentalData.status || "PENDING_REVIEW") as ListingStatus,
+        status: "PENDING_REVIEW" as ListingStatus,
+        isApproved: false,
+        submittedForReviewAt: new Date(),
       },
     })
 
@@ -258,7 +266,10 @@ export async function updateRental(
         pricePerDay: parseFloat(rentalData.pricePerDay) || 0,
         originalPrice: rentalData.originalPrice ? parseFloat(rentalData.originalPrice) : null,
         cancellationPolicy: rentalData.cancellationPolicy || null,
-        status: (rentalData.status || "PENDING_REVIEW") as unknown as ListingStatus,
+        status: "PENDING_REVIEW" as ListingStatus,
+        isApproved: false,
+        approvedAt: null,
+        submittedForReviewAt: new Date(),
       },
     })
 
@@ -290,5 +301,5 @@ export async function updateRental(
 }
 
 export async function deleteRental(id: string) {
-  return prisma.rental.delete({ where: { id } })
+  return prisma.rental.update({ where: { id }, data: { status: "ARCHIVED", isActive: false, isApproved: false, archivedAt: new Date() } })
 }

@@ -6,6 +6,12 @@ The tours module manages public tour browsing, host tour CRUD, tour operational 
 
 Booking intent, travelers, cancellation, and payment are documented in `TOUR_BOOKING.md`.
 
+## Risk-aware listing controls
+
+Tour supply stores an explicit `LOW`, `MEDIUM`, `HIGH`, or `VERY_HIGH` risk level separately from physical difficulty. Submission requires an honest public risk disclosure, public meeting-area guidance, eligibility, and minimum age. Medium and higher risk require an emergency/escalation plan. High risk additionally requires adult travelers, an equipment checklist, supported traveler verification, and organizer approval for each join request.
+
+Very-high-risk listings may be documented but cannot be activated until caretaker assignment and qualification checks are implemented. Admin activation re-runs the same server policy. Migration `20260910060000_tour_risk_safety` returns existing active/approved tours to `PENDING_REVIEW`; no old listing inherits an unreviewed safety classification.
+
 ## Source Files
 
 ```text
@@ -14,9 +20,8 @@ modules/tour/controllers/tour.controller.ts
 modules/tour/controllers/tour-operations.controller.ts
 modules/tour/services/tour.service.ts
 modules/tour/services/tour-operations.service.ts
-services/tour.service.ts
-services/tour-operations.service.ts
-services/tour-traveler-duplicate.service.ts
+modules/tour/services/tour-listing-policy.ts
+modules/tour/services/tour-traveler-duplicate.service.ts
 ```
 
 ## Auth
@@ -64,8 +69,10 @@ PUT /api/tour/[id]
 
 DELETE /api/tour/[id]
   -> require host owner
-  -> delete or deactivate tour
+  -> soft-archive tour
 ```
+
+Public list/detail results require an active, approved listing owned by an active, approved and verified host. Host create/update ignores client-supplied publication status; every material save re-enters moderation and revokes prior approval.
 
 ## Operational Endpoints
 
@@ -136,7 +143,9 @@ POST /api/tour/[id]/documents
 Expected pattern:
 
 ```text
-GET is for tour participants/hosts where authorized.
+GET requires either the active approved owning host or a participant whose membership and canonical booking are confirmed.
+Cancellation/removal revokes access; completed members retain read access to archived announcements/documents.
+Participant document reads exclude host-only records.
 POST is host-owned operational content.
 ```
 
@@ -193,5 +202,6 @@ Chat send should require authenticated user and tour access.
 ```text
 Host approval/KYC should be enforced consistently before host mutations if product policy requires it.
 Tour operations should have ownership checks on every POST/PATCH/DELETE.
-Chat and documents should enforce participant/host access to avoid data leakage.
+Trip Circle database/browser authorization tests remain required for chat, roster, announcements and documents.
+Message-level reporting, blocking and moderation remain required.
 ```

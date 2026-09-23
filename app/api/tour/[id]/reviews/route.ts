@@ -1,31 +1,30 @@
-import { NextRequest, NextResponse } from "next/server"
-import { cookies } from "next/headers"
-import { getServerSession } from "next-auth"
-import { authOptions } from "@/lib/auth"
-import { prisma } from "@/lib/prisma"
-import { getUserFromSessionToken } from "@/modules/auth/services/auth.service"
-import type { IdRouteParams as Params } from "@/types/routes"
-
-async function getAuthenticatedUserId() {
-  const token = (await cookies()).get("token")?.value
-  if (token) {
-    const user = await getUserFromSessionToken(token)
-    if (user?.id) return String(user.id)
-  }
-  const session = await getServerSession(authOptions)
-  return session?.user?.id ? String(session.user.id) : null
-}
+import { NextRequest, NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
+import { currentUserId } from "@/utils/user-auth";
+import { assertRateLimit, clientIp } from "@/lib/rate-limit";
+import type { IdRouteParams as Params } from "@/types/routes";
 
 async function findTour(id: string) {
-  return prisma.tour.findFirst({ where: { OR: [{ id }, { slug: id }], deletedAt: null }, select: { id: true, hostId: true } })
+  return prisma.tour.findFirst({
+    where: {
+      OR: [{ id }, { slug: id }],
+      deletedAt: null,
+      status: "ACTIVE",
+      isActive: true,
+      isApproved: true,
+      Host: { is: { isActive: true, isApproved: true, isVerified: true } },
+    },
+    select: { id: true, hostId: true },
+  });
 }
 
 export async function GET(_req: NextRequest, { params }: Params) {
-  const tour = await findTour((await params).id)
-  if (!tour) return NextResponse.json({ error: "Tour not found" }, { status: 404 })
+  const tour = await findTour((await params).id);
+  if (!tour)
+    return NextResponse.json({ error: "Tour not found" }, { status: 404 });
 
   const reviews = await prisma.$queryRaw`
-    SELECT r."id", r."rating", r."title", r."comment", r."createdAt",
+    SELECT r."id", r."rating", r."title", r."comment", r."response", r."responseAt", r."createdAt",
            json_build_object(
              'name', u."name",
              'UserProfile', json_build_object('avatarUrl', up."avatarUrl")
@@ -37,46 +36,89 @@ export async function GET(_req: NextRequest, { params }: Params) {
       AND COALESCE(r."isPublished", true) = true
     ORDER BY r."createdAt" DESC
     LIMIT 25
-  `
+  `;
 
-  return NextResponse.json({ data: reviews })
+  return NextResponse.json({ data: reviews });
 }
 
 export async function POST(req: NextRequest, { params }: Params) {
-  const userId = await getAuthenticatedUserId()
-  if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+  const userId = await currentUserId();
+  if (!userId)
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  await assertRateLimit(`tour-review:${userId}:${clientIp(req)}`, 5, 60);
 
-  const tour = await findTour((await params).id)
-  if (!tour) return NextResponse.json({ error: "Tour not found" }, { status: 404 })
+  const tour = await findTour((await params).id);
+  if (!tour)
+    return NextResponse.json({ error: "Tour not found" }, { status: 404 });
 
   const completedBooking = await prisma.booking.findFirst({
     where: { userId, tourId: tour.id, status: "COMPLETED" },
     select: { id: true },
-  })
-  if (!completedBooking) return NextResponse.json({ error: "Only completed travelers can review this tour" }, { status: 403 })
+  });
+  if (!completedBooking)
+    return NextResponse.json(
+      { error: "Only completed travelers can review this tour" },
+      { status: 403 },
+    );
 
-  const body = await req.json().catch(() => ({})) as { rating?: number; title?: string; comment?: string }
-  const rating = Math.max(1, Math.min(5, Math.trunc(Number(body.rating ?? 5))))
-  if (!body.comment?.trim()) return NextResponse.json({ error: "Review comment is required" }, { status: 400 })
+  const body = (await req.json().catch(() => ({}))) as {
+    rating?: number;
+    title?: string;
+    comment?: string;
+  };
+  const rating = Math.trunc(Number(body.rating));
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5)
+    return NextResponse.json(
+      { error: "Rating must be between 1 and 5" },
+      { status: 400 },
+    );
+  if (
+    !body.comment?.trim() ||
+    body.comment.trim().length < 10 ||
+    body.comment.trim().length > 2000
+  )
+    return NextResponse.json(
+      { error: "Review comment must be 10-2000 characters" },
+      { status: 400 },
+    );
+  const comment = body.comment.trim();
+  const title = body.title?.trim();
+  if (title && title.length > 120)
+    return NextResponse.json(
+      { error: "Review title must be 120 characters or fewer" },
+      { status: 400 },
+    );
 
-  const rows = await prisma.$queryRaw<Record<string, unknown>[]>`
-    INSERT INTO "Review" ("id", "userId", "hostId", "tourId", "bookingId", "target", "rating", "title", "comment", "isPublished", "createdAt", "updatedAt")
-    VALUES (gen_random_uuid()::text, ${userId}, ${tour.hostId}, ${tour.id}, ${completedBooking.id}, 'TOUR', ${rating}, ${body.title?.trim() || null}, ${body.comment.trim()}, true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-    ON CONFLICT ("bookingId") DO UPDATE SET
-      "rating" = EXCLUDED."rating",
-      "title" = EXCLUDED."title",
-      "comment" = EXCLUDED."comment",
-      "isPublished" = true,
-      "updatedAt" = CURRENT_TIMESTAMP
-    RETURNING "id", "rating", "title", "comment", "createdAt"
-  `
+  const review = await prisma.$transaction(async (tx) => {
+    const saved = await tx.review.upsert({
+      where: { bookingId: completedBooking.id },
+      create: {
+        userId,
+        hostId: tour.hostId,
+        tourId: tour.id,
+        bookingId: completedBooking.id,
+        target: "TOUR",
+        rating,
+        title: title || null,
+        comment,
+        isPublished: true,
+      },
+      update: { rating, title: title || null, comment },
+    });
+    const aggregate = await tx.review.aggregate({
+      where: { tourId: tour.id, target: "TOUR", isPublished: true },
+      _avg: { rating: true },
+      _count: { rating: true },
+    });
+    await tx.tour.update({
+      where: { id: tour.id },
+      data: {
+        averageRating: aggregate._avg.rating ?? 0,
+        totalReviews: aggregate._count.rating,
+      },
+    });
+    return saved;
+  });
 
-  await prisma.tour.update({
-    where: { id: tour.id },
-    data: {
-      totalReviews: { increment: 1 },
-    },
-  }).catch(() => null)
-
-  return NextResponse.json({ data: rows[0] }, { status: 201 })
+  return NextResponse.json({ data: review }, { status: 201 });
 }

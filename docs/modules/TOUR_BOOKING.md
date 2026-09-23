@@ -4,6 +4,13 @@
 
 The tour booking module handles group booking intent creation, traveler addition, traveler duplicate checks, waitlisting, cancellation, refund calculation, and tour payment order/verification.
 
+## Risk disclosure and minimum-age contract
+
+- Checkout requires explicit risk-disclosure acknowledgment; a client checkbox alone is insufficient because the API schema requires literal `true`.
+- Every traveler must meet the stored minimum age on the actual departure date; DOB takes precedence over a supplied age.
+- Booking creation stores the acknowledgment timestamp and an immutable snapshot of risk level, disclosure, meeting guidance, eligibility, equipment, minimum age, and caretaker requirement in both the canonical and operational booking records.
+- Traveler booking detail displays the captured snapshot after purchase. Acknowledgment does not waive statutory or contractual rights.
+
 ## Source Files
 
 ```text
@@ -13,14 +20,18 @@ app/api/tour-bookings/[bookingId]/travelers/route.ts
 app/api/tour-bookings/[bookingId]/cancel/route.ts
 app/api/tour/[id]/payment/order/route.ts
 app/api/tour/[id]/payment/verify/route.ts
-controllers/tour-booking-engine.controller.ts
+app/api/webhooks/razorpay/route.ts
 modules/tour/controllers/tour-booking-engine.controller.ts
-services/tour-booking-engine.service.ts
-services/tour-traveler-duplicate.service.ts
-services/tour-operations.service.ts
+modules/tour/controllers/tour.controller.ts
+modules/tour/services/tour-booking-engine.service.ts
+modules/tour/services/tour-cancellation-policy.ts
+modules/tour/services/tour-traveler-duplicate.service.ts
+modules/tour/services/tour-operations.service.ts
+modules/booking/services/razorpay-webhook.service.ts
 lib/traveler-normalization.ts
 lib/traveler-identity.ts
 lib/razorpay.ts
+lib/payment-signature.ts
 ```
 
 ## Auth
@@ -56,6 +67,7 @@ POST /api/tour/[id]/booking-intents
   -> authenticate user
   -> rate limit by user/ip
   -> validate contact and traveler payload
+  -> require risk acknowledgment and validate every traveler against departure-date minimum age
   -> find tour by id or slug
   -> confirm tour is ACTIVE/open
   -> start serializable Prisma transaction
@@ -64,6 +76,8 @@ POST /api/tour/[id]/booking-intents
   -> check traveler duplicates
   -> calculate available seats
   -> calculate unit price, subtotal, taxes, total
+  -> atomically create canonical commerce Booking, Payment and timeline
+  -> persist the immutable risk disclosure snapshot in both booking models
   -> create PENDING booking if seats available
   -> create WAITLISTED booking if seats unavailable
   -> insert TourTraveler rows
@@ -114,17 +128,26 @@ Less than 24 hours before start: 0%
 ```text
 POST /api/tour/[id]/payment/order
   -> authenticate user
-  -> verify booking/tour context
-  -> create Razorpay order
+  -> verify booking owner, route tour, hold and waitlist state
+  -> claim payment before external provider call
+  -> reuse an existing provider order or create one
   -> return provider order details
 
 POST /api/tour/[id]/payment/verify
   -> authenticate user
-  -> verify Razorpay signature
+  -> bind provider order to authenticated user and route tour
+  -> verify Razorpay signature with constant-time comparison
   -> update payment status
   -> confirm booking/travelers
   -> reserve seats/inventory
   -> return payment confirmation
+
+POST /api/webhooks/razorpay
+  -> read exact raw request body
+  -> verify HMAC before JSON parsing
+  -> deduplicate by x-razorpay-event-id
+  -> validate expected amount and currency
+  -> confirm or fail the linked payment idempotently
 ```
 
 ## Traveler Duplicate Flow
@@ -176,4 +199,6 @@ Keep serializable transactions for seat assignment.
 Payment confirmation must be idempotent.
 Cancellation and refund creation must be idempotent.
 Sensitive identity values should remain hashed where possible.
+Automated provider refund execution and reconciliation remain required.
+The Booking/TourBooking transactional bridge is temporary and requires a rehearsed consolidation migration.
 ```

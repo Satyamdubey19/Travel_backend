@@ -33,7 +33,7 @@ npm run dev
 - jsonwebtoken for token support.
 - Razorpay for payments.
 - Cloudinary and upload middleware for media.
-- Resend/SMTP mail helpers.
+- Brevo transactional mail helper (SMTP variables are legacy and not used by auth delivery).
 - Socket.IO for real-time chat/notifications.
 - BullMQ/ioredis-style worker structure for background jobs.
 - Zod validators for request payload validation.
@@ -97,16 +97,11 @@ GOOGLE_CLIENT_SECRET
 OPENCAGE_API_KEY
 LOCATION_API_KEY
 GROQ_API_KEY
-RESEND_API_KEY
+BREVO_API_KEY
 CLOUDINARY_CLOUD_NAME
 CLOUDINARY_API_KEY
 CLOUDINARY_API_SECRET
 CLOUDINARY_URL
-SMTP_HOST
-SMTP_PORT
-EMAIL_USER
-EMAIL_PASS
-EMAIL_FROM
 RAZORPAY_KEY_ID
 RAZORPAY_KEY_SECRET
 RAZORPAY_WEBHOOK_SECRET
@@ -850,7 +845,7 @@ Email helpers live under:
 
 ```text
 lib/mail.ts
-lib/resend.ts
+lib/brevo.ts
 emails/
 services/email/
 workers/tour-email.worker.ts
@@ -1024,7 +1019,7 @@ http://localhost:4000
 
 - Never commit `.env`.
 - Never put real secrets in `.env.example`.
-- Keep OAuth, database, Cloudinary, Razorpay, Resend, Groq, and SMTP credentials in backend environment only.
+- Keep OAuth, database, Cloudinary, Razorpay, Brevo, Groq, and SMTP credentials in backend environment only.
 - Verify payment signatures on backend only.
 - Validate booking ownership before returning or mutating booking data.
 - Enforce role checks for host and admin routes.
@@ -1120,7 +1115,7 @@ Bookings             modules/booking, services/my-bookings.service.ts
 Payments             lib/razorpay.ts, src/modules/payments
 Wishlist             app/api/wishlist, modules/wishlist
 Uploads              app/api/upload, middleware/multer.ts, lib/cloudinary.ts
-Email                lib/mail.ts, lib/resend.ts, services/email, workers
+Email                lib/mail.ts, lib/brevo.ts, services/email, workers
 Realtime             lib/socket-server.ts, src/realtime
 Database             prisma/schema.prisma, prisma/migrations
 ```

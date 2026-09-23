@@ -1,6 +1,7 @@
 import { createServer } from "http"
 import dotenv from "dotenv"
 import { Server } from "socket.io"
+import { readCookie, requireChatMessage, requireTourKey, SocketRateLimiter } from "./socket-security"
 
 dotenv.config({ path: ".env.local" })
 dotenv.config({ path: ".env" })
@@ -20,59 +21,120 @@ const io = new Server(httpServer, {
   },
 })
 
+const limiter = new SocketRateLimiter()
+
+type EventPayload = Record<string, unknown> | null | undefined
+
+function publicSocketError(error: unknown) {
+  const statusCode = typeof error === "object" && error && "statusCode" in error
+    ? Number((error as { statusCode?: number }).statusCode)
+    : 500
+  if (statusCode >= 400 && statusCode < 500 && error instanceof Error) return error.message
+  return "The live connection could not complete this request"
+}
+
 async function startSocketServer() {
-  const { sendTourChatMessage } = await import("../services/tour.service")
+  const [{ getUserFromSessionToken }, { requireTourCircleAccess }, { sendTourChatMessage }, { blockedUserIdsFor }] = await Promise.all([
+    import("../modules/auth/services/auth.service"),
+    import("../modules/tour/services/tour-circle-access.service"),
+    import("../modules/tour/services/tour.service"),
+    import("../modules/community/services/community-safety.service"),
+  ])
+
+  io.use(async (socket, next) => {
+    try {
+      const token = readCookie(socket.handshake.headers.cookie, "token")
+      if (!token) return next(new Error("Authentication required"))
+
+      const user = await getUserFromSessionToken(token)
+      if (!user) return next(new Error("Authentication required"))
+
+      socket.data.sessionToken = token
+      socket.data.user = { id: user.id, name: user.name, role: user.role }
+      next()
+    } catch {
+      next(new Error("Authentication required"))
+    }
+  })
 
   io.on("connection", (socket) => {
-    console.log(`Socket connected: ${socket.id}`)
+    const rateKey = `${socket.data.user.id}:${socket.id}:`
 
-    socket.on("tour:join", ({ tourId }: { tourId?: string }) => {
-      if (!tourId) return
-      socket.join(`tour:${tourId}`)
-      console.log(`Socket ${socket.id} joined tour:${tourId}`)
-    })
+    const currentUser = async () => {
+      const user = await getUserFromSessionToken(socket.data.sessionToken)
+      if (!user || user.id !== socket.data.user.id) {
+        socket.disconnect(true)
+        throw Object.assign(new Error("Your session has expired"), { statusCode: 401 })
+      }
+      return user
+    }
 
-    socket.on("tour:typing:start", ({ tourId, userId, name }: { tourId?: string; userId?: string; name?: string }) => {
-      if (!tourId || !userId) return
-      socket.to(`tour:${tourId}`).emit("tour:typing:start", { tourId, userId, name })
-    })
+    const authorizeTour = async (value: unknown) => {
+      const tourKey = requireTourKey(value)
+      const user = await currentUser()
+      const access = await requireTourCircleAccess(user.id, tourKey)
+      return { user, access, room: `tour:${access.tour.id}` }
+    }
 
-    socket.on("tour:typing:stop", ({ tourId, userId }: { tourId?: string; userId?: string }) => {
-      if (!tourId || !userId) return
-      socket.to(`tour:${tourId}`).emit("tour:typing:stop", { tourId, userId })
-    })
+    const emitError = (error: unknown) => {
+      socket.emit("tour:message:error", { error: publicSocketError(error) })
+    }
 
-    socket.on("tour:message:reaction", ({ tourId, messageId, userId, emoji }: { tourId?: string; messageId?: string; userId?: string; emoji?: string }) => {
-      if (!tourId || !messageId || !userId || !emoji) return
-      io.to(`tour:${tourId}`).emit("tour:message:reaction", { tourId, messageId, userId, emoji, createdAt: new Date().toISOString() })
-    })
+    const emitToUnblockedRoom = async (room: string, senderId: string, event: string, payload: unknown, includeSender: boolean) => {
+      const blocked = await blockedUserIdsFor(senderId)
+      const members = await io.in(room).fetchSockets()
+      for (const member of members) {
+        if (!includeSender && member.id === socket.id) continue
+        const memberUserId = typeof member.data.user?.id === "string" ? member.data.user.id : ""
+        if (!memberUserId || blocked.has(memberUserId)) continue
+        member.emit(event, payload)
+      }
+    }
 
-    socket.on("tour:announcement:new", ({ tourId, announcement }: { tourId?: string; announcement?: unknown }) => {
-      if (!tourId || !announcement) return
-      io.to(`tour:${tourId}`).emit("tour:announcement:new", announcement)
-      io.to(`tour:${tourId}`).emit("tour:message:new", {
-        id: `announcement:${Date.now()}`,
-        message: typeof announcement === "object" && announcement && "message" in announcement ? (announcement as { message?: string }).message : "New trip announcement",
-        messageType: "SYSTEM",
-        createdAt: new Date().toISOString(),
-      })
-    })
-
-    socket.on("tour:message:send", async ({ tourId, userId, message, scope }: { tourId?: string; userId?: string; message?: string; scope?: string }) => {
+    socket.on("tour:join", async (payload: EventPayload) => {
       try {
-        if (!tourId || !userId || !message) throw new Error("tourId, userId, and message are required")
-        const accessScope = scope === "participant" ? "participant" : "host-or-participant"
-        const savedMessage = await sendTourChatMessage(userId, tourId, message, accessScope)
-        io.to(`tour:${tourId}`).emit("tour:message:new", savedMessage)
+        if (!limiter.consume(`${rateKey}join`, 15, 60_000)) {
+          throw Object.assign(new Error("Too many room requests. Please wait a moment."), { statusCode: 429 })
+        }
+        const { access, room } = await authorizeTour(payload?.tourId)
+        await socket.join(room)
+        socket.emit("tour:joined", { tourId: access.tour.id })
       } catch (error) {
-        const message = error instanceof Error ? error.message : "Message failed"
-        socket.emit("tour:message:error", { error: message })
-        console.error("Error sending message:", error)
+        emitError(error)
+      }
+    })
+
+    const relayTyping = (event: "tour:typing:start" | "tour:typing:stop") => async (payload: EventPayload) => {
+      try {
+        if (!limiter.consume(`${rateKey}typing`, 30, 10_000)) return
+        const { user, access, room } = await authorizeTour(payload?.tourId)
+        if (!socket.rooms.has(room)) throw Object.assign(new Error("Join the Trip Circle before posting"), { statusCode: 403 })
+        await emitToUnblockedRoom(room, user.id, event, { tourId: access.tour.id, userId: user.id, name: user.name }, false)
+      } catch (error) {
+        emitError(error)
+      }
+    }
+
+    socket.on("tour:typing:start", relayTyping("tour:typing:start"))
+    socket.on("tour:typing:stop", relayTyping("tour:typing:stop"))
+
+    socket.on("tour:message:send", async (payload: EventPayload) => {
+      try {
+        if (!limiter.consume(`${rateKey}message`, 12, 10_000)) {
+          throw Object.assign(new Error("You are sending messages too quickly"), { statusCode: 429 })
+        }
+        const message = requireChatMessage(payload?.message)
+        const { user, access, room } = await authorizeTour(payload?.tourId)
+        if (!socket.rooms.has(room)) throw Object.assign(new Error("Join the Trip Circle before posting"), { statusCode: 403 })
+        const savedMessage = await sendTourChatMessage(user.id, access.tour.id, message)
+        await emitToUnblockedRoom(room, user.id, "tour:message:new", savedMessage, true)
+      } catch (error) {
+        emitError(error)
       }
     })
 
     socket.on("disconnect", () => {
-      console.log(`Socket disconnected: ${socket.id}`)
+      limiter.clear(rateKey)
     })
   })
 

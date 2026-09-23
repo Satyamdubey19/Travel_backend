@@ -72,6 +72,7 @@ model Activity {
 model ActivityBooking {
   id                      String                    @id @default(uuid())
   bookingCode             String                    @unique
+  idempotencyKey          String?                   @unique
   userId                  String
   hostId                  String
   activityId              String
@@ -85,6 +86,7 @@ model ActivityBooking {
   totalAmount             Decimal                   @db.Decimal(10, 2)
   currency                String                    @default("INR")
   status                  BookingStatus             @default(PENDING)
+  expiresAt               DateTime?
   contactName             String
   contactEmail            String
   contactPhone            String
@@ -100,12 +102,14 @@ model ActivityBooking {
   ActivityBookingGuest    ActivityBookingGuest[]
   ActivityBookingTimeline ActivityBookingTimeline[]
   ActivityPayment         ActivityPayment?
+  ActivityRefund          ActivityRefund?
   Review                  Review?
 
   @@index([activityId])
   @@index([hostId])
   @@index([status])
   @@index([userId])
+  @@index([expiresAt])
 }
 
 model ActivityBookingGuest {
@@ -142,15 +146,36 @@ model ActivityPayment {
   currency          String          @default("INR")
   status            PaymentStatus   @default(PENDING)
   provider          String          @default("razorpay")
-  providerOrderId   String?
-  providerPaymentId String?
+  providerOrderId   String?         @unique
+  providerPaymentId String?         @unique
   transactionId     String?         @unique
   paidAt            DateTime?
   createdAt         DateTime        @default(now())
   updatedAt         DateTime        @updatedAt
   ActivityBooking   ActivityBooking @relation(fields: [activityBookingId], references: [id], onDelete: Cascade)
+  ActivityRefund    ActivityRefund?
 
   @@index([status])
+}
+
+model ActivityRefund {
+  id                String           @id @default(uuid())
+  activityBookingId String           @unique
+  activityPaymentId String?          @unique
+  requestedAmount   Decimal          @db.Decimal(10, 2)
+  approvedAmount    Decimal?         @db.Decimal(10, 2)
+  currency          String           @default("INR")
+  status            String           @default("REVIEW_PENDING")
+  reason            String?
+  policySnapshot    String
+  providerRefundId  String?
+  failureReason     String?
+  createdAt         DateTime         @default(now())
+  processedAt       DateTime?
+  ActivityBooking   ActivityBooking  @relation(fields: [activityBookingId], references: [id], onDelete: Cascade)
+  ActivityPayment   ActivityPayment? @relation(fields: [activityPaymentId], references: [id])
+
+  @@index([status, createdAt])
 }
 
 model ActivitySlot {
@@ -181,10 +206,10 @@ model AdminProfile {
 }
 
 model Amenity {
-  id           String         @id @default(uuid())
-  name         String         @unique
-  icon         String?
-  category     String?
+  id       String  @id @default(uuid())
+  name     String  @unique
+  icon     String?
+  category String?
 }
 
 model AuditLog {
@@ -213,43 +238,46 @@ model AuditLog {
 }
 
 model Booking {
-  id                   String                 @id @default(uuid())
-  bookingCode          String                 @unique
-  userId               String
-  hostId               String
-  tourId               String?
-  checkIn              DateTime?
-  checkOut             DateTime?
-  totalGuests          Int                    @default(1)
-  adults               Int                    @default(1)
-  children             Int                    @default(0)
-  infants              Int                    @default(0)
-  contactName          String
-  contactEmail         String
-  contactPhone         String
-  specialRequests      String?
-  couponId             String?
-  TourParticipant      TourParticipant[]
-  subtotal             Decimal                @db.Decimal(10, 2)
-  taxes                Decimal                @default(0) @db.Decimal(10, 2)
-  discount             Decimal                @default(0) @db.Decimal(10, 2)
-  totalAmount          Decimal                @db.Decimal(10, 2)
-  currency             String                 @default("INR")
-  status               BookingStatus          @default(PENDING)
+  id                     String             @id @default(uuid())
+  bookingCode            String             @unique
+  userId                 String
+  hostId                 String
+  tourId                 String?
+  checkIn                DateTime?
+  checkOut               DateTime?
+  totalGuests            Int                @default(1)
+  adults                 Int                @default(1)
+  children               Int                @default(0)
+  infants                Int                @default(0)
+  contactName            String
+  contactEmail           String
+  contactPhone           String
+  specialRequests        String?
+  riskAcknowledgedAt     DateTime?
+  riskDisclosureSnapshot Json?
+  couponId               String?
+  TourParticipant        TourParticipant[]
+  subtotal               Decimal            @db.Decimal(10, 2)
+  taxes                  Decimal            @default(0) @db.Decimal(10, 2)
+  discount               Decimal            @default(0) @db.Decimal(10, 2)
+  totalAmount            Decimal            @db.Decimal(10, 2)
+  currency               String             @default("INR")
+  status                 BookingStatus      @default(PENDING)
   // Pending bookings can expire if payment is not completed before this time.
-  expiresAt            DateTime?
-  cancellationReason   String?
-  cancelledAt          DateTime?
-  createdAt            DateTime               @default(now())
-  updatedAt            DateTime               @updatedAt
-  Coupon               Coupon?                @relation(fields: [couponId], references: [id])
-  Host                 Host                   @relation(fields: [hostId], references: [id])
-  Tour                 Tour?                  @relation(fields: [tourId], references: [id], onDelete: Restrict)
-  User                 User                   @relation(fields: [userId], references: [id])
-  BookingTimeline      BookingTimeline[]
-  CouponRedemption     CouponRedemption[]
-  Payment              Payment?
-  Review               Review?
+  expiresAt              DateTime?
+  cancellationReason     String?
+  cancelledAt            DateTime?
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+  Coupon                 Coupon?            @relation(fields: [couponId], references: [id])
+  Host                   Host               @relation(fields: [hostId], references: [id])
+  Tour                   Tour?              @relation(fields: [tourId], references: [id], onDelete: Restrict)
+  User                   User               @relation(fields: [userId], references: [id])
+  BookingTimeline        BookingTimeline[]
+  CouponRedemption       CouponRedemption[]
+  Payment                Payment?
+  Review                 Review?
+  Incident               Incident[]
 
   @@index([bookingCode])
   @@index([hostId])
@@ -361,6 +389,7 @@ model Host {
   RentalBooking     RentalBooking[]
   Review            Review[]
   Tour              Tour[]
+  Incident          Incident[]
 
   @@index([city])
   @@index([isApproved, isActive])
@@ -393,6 +422,52 @@ model KycApplication {
   updatedAt            DateTime  @updatedAt
   Host                 Host      @relation(fields: [hostId], references: [id], onDelete: Cascade)
   ReviewedBy           User?     @relation("KycReviewer", fields: [reviewedById], references: [id])
+  id                       String    @id @default(uuid())
+  hostId                   String
+  status                   KycStatus @default(PENDING)
+  hostType                 String    @default("INDIVIDUAL")
+  firstName                String
+  lastName                 String
+  dateOfBirth              DateTime?
+  nationality              String?
+  idType                   String
+  idNumber                 String
+  idFrontUrl               String?
+  idBackUrl                String?
+  selfieUrl                String?
+  streetAddress            String?
+  city                     String?
+  state                    String?
+  postalCode               String?
+  country                  String?   @default("India")
+  addressProofType         String?
+  addressProofUrl          String?
+  businessName             String?
+  gstin                    String?
+  businessPan              String?
+  businessDocUrl           String?
+  bankAccountName          String?
+  bankAccountNumber        String?
+  bankIfsc                 String?
+  bankName                 String?
+  cancelledChequeUrl       String?
+  emergencyContactName     String?
+  emergencyContactPhone    String?
+  emergencyContactRelation String?
+  safetyCertUrl            String?
+  agreedToHostSafetyPolicy Boolean   @default(false)
+  safetyPolicyAgreedAt     DateTime?
+  submittedAt              DateTime  @default(now())
+  reviewedById             String?
+  reviewedAt               DateTime?
+  rejectionReason          String?
+  reviewNotes              String?
+  resubmissionAllowed      Boolean   @default(false)
+  resubmissionDeadline     DateTime?
+  createdAt                DateTime  @default(now())
+  updatedAt                DateTime  @updatedAt
+  Host                     Host      @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  ReviewedBy               User?     @relation("KycReviewer", fields: [reviewedById], references: [id])
 
   @@index([hostId])
   @@index([status])
@@ -400,19 +475,41 @@ model KycApplication {
 }
 
 model Notification {
-  id        String           @id @default(uuid())
-  userId    String
-  type      NotificationType
-  title     String
-  message   String
-  data      Json?
-  isRead    Boolean          @default(false)
-  readAt    DateTime?
-  createdAt DateTime         @default(now())
-  User      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id                   String                 @id @default(uuid())
+  userId               String
+  type                 NotificationType
+  title                String
+  message              String
+  data                 Json?
+  isRead               Boolean                @default(false)
+  readAt               DateTime?
+  createdAt            DateTime               @default(now())
+  User                 User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  NotificationDelivery NotificationDelivery[]
 
   @@index([userId, createdAt])
   @@index([userId, isRead])
+}
+
+model NotificationDelivery {
+  id             String                      @id @default(uuid())
+  notificationId String
+  userId         String
+  channel        NotificationDeliveryChannel @default(EMAIL)
+  status         NotificationDeliveryStatus  @default(PENDING)
+  attempts       Int                         @default(0)
+  availableAt    DateTime                    @default(now())
+  lockedAt       DateTime?
+  deliveredAt    DateTime?
+  lastError      String?
+  createdAt      DateTime                    @default(now())
+  updatedAt      DateTime                    @updatedAt
+  Notification   Notification                @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  User           User                        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([notificationId, channel])
+  @@index([status, availableAt])
+  @@index([userId, status])
 }
 
 model Payment {
@@ -426,8 +523,8 @@ model Payment {
   currency          String        @default("INR")
   status            PaymentStatus @default(PENDING)
   provider          String        @default("razorpay")
-  providerOrderId   String?
-  providerPaymentId String?
+  providerOrderId   String?       @unique
+  providerPaymentId String?       @unique
   transactionId     String?       @unique
   paidAt            DateTime?
   refundedAt        DateTime?
@@ -441,6 +538,22 @@ model Payment {
   @@index([hostId])
   @@index([status])
   @@index([userId])
+}
+
+model PaymentWebhookEvent {
+  id                String    @id @default(uuid())
+  provider          String    @default("razorpay")
+  eventId           String    @unique
+  eventType         String
+  providerOrderId   String?
+  providerPaymentId String?
+  status            String    @default("PROCESSING")
+  failureReason     String?
+  receivedAt        DateTime  @default(now())
+  processedAt       DateTime?
+
+  @@index([providerOrderId])
+  @@index([status, receivedAt])
 }
 
 model Payout {
@@ -702,6 +815,7 @@ model Rental {
 model RentalBooking {
   id                    String                  @id @default(uuid())
   bookingCode           String                  @unique
+  idempotencyKey        String?                 @unique
   userId                String
   hostId                String
   rentalId              String
@@ -717,6 +831,7 @@ model RentalBooking {
   totalAmount           Decimal                 @db.Decimal(10, 2)
   currency              String                  @default("INR")
   status                BookingStatus           @default(PENDING)
+  expiresAt             DateTime?
   contactName           String
   contactEmail          String
   contactPhone          String
@@ -729,13 +844,47 @@ model RentalBooking {
   Rental                Rental                  @relation(fields: [rentalId], references: [id])
   User                  User                    @relation(fields: [userId], references: [id])
   RentalBookingTimeline RentalBookingTimeline[]
+  RentalInspection      RentalInspection[]
   RentalPayment         RentalPayment?
+  RentalRefund          RentalRefund?
   Review                Review?
 
   @@index([hostId])
   @@index([rentalId])
   @@index([status])
+  @@index([expiresAt])
   @@index([userId])
+}
+
+model RentalInspection {
+  id                   String                   @id @default(uuid())
+  bookingId            String
+  stage                RentalInspectionStage
+  status               RentalInspectionStatus   @default(DRAFT)
+  odometerKm           Int?
+  fuelOrChargePercent  Int?
+  conditionNotes       String?
+  checklist            Json?
+  damages              Json?
+  evidenceAssetIds     String[]
+  recordedByUserId     String
+  submittedAt          DateTime?
+  acknowledgedByUserId String?
+  acknowledgedAt       DateTime?
+  disputedByUserId     String?
+  disputedAt           DateTime?
+  disputeReason        String?
+  resolution           RentalDisputeResolution?
+  resolutionNotes      String?
+  resolvedByUserId     String?
+  resolvedAt           DateTime?
+  createdAt            DateTime                 @default(now())
+  updatedAt            DateTime                 @updatedAt
+  RentalBooking        RentalBooking            @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  @@unique([bookingId, stage])
+  @@index([bookingId, status])
+  @@index([submittedAt])
 }
 
 model RentalBookingTimeline {
@@ -775,15 +924,36 @@ model RentalPayment {
   currency          String        @default("INR")
   status            PaymentStatus @default(PENDING)
   provider          String        @default("razorpay")
-  providerOrderId   String?
-  providerPaymentId String?
+  providerOrderId   String?       @unique
+  providerPaymentId String?       @unique
   transactionId     String?       @unique
   paidAt            DateTime?
   createdAt         DateTime      @default(now())
   updatedAt         DateTime      @updatedAt
   RentalBooking     RentalBooking @relation(fields: [rentalBookingId], references: [id], onDelete: Cascade)
+  RentalRefund      RentalRefund?
 
   @@index([status])
+}
+
+model RentalRefund {
+  id               String         @id @default(uuid())
+  rentalBookingId  String         @unique
+  rentalPaymentId  String?        @unique
+  requestedAmount  Decimal        @db.Decimal(10, 2)
+  approvedAmount   Decimal?       @db.Decimal(10, 2)
+  currency         String         @default("INR")
+  status           String         @default("REVIEW_PENDING")
+  reason           String?
+  policySnapshot   String
+  providerRefundId String?
+  failureReason    String?
+  createdAt        DateTime       @default(now())
+  processedAt      DateTime?
+  RentalBooking    RentalBooking  @relation(fields: [rentalBookingId], references: [id], onDelete: Cascade)
+  RentalPayment    RentalPayment? @relation(fields: [rentalPaymentId], references: [id])
+
+  @@index([status, createdAt])
 }
 
 model Review {
@@ -849,47 +1019,112 @@ model TravelerReport {
   @@index([reportedUserId])
 }
 
+enum CommunityReportReason {
+  HARASSMENT
+  HATE_OR_ABUSE
+  SEXUAL_CONTENT
+  THREAT_OR_SAFETY
+  SCAM_OR_SPAM
+  PRIVACY_VIOLATION
+  OTHER
+}
+
+enum CommunityReportStatus {
+  OPEN
+  IN_REVIEW
+  ACTIONED
+  DISMISSED
+}
+
+model UserBlock {
+  id        String   @id @default(uuid())
+  blockerId String
+  blockedId String
+  createdAt DateTime @default(now())
+
+  Blocker User @relation("UserBlocksCreated", fields: [blockerId], references: [id], onDelete: Cascade)
+  Blocked User @relation("UserBlocksReceived", fields: [blockedId], references: [id], onDelete: Cascade)
+
+  @@unique([blockerId, blockedId])
+  @@index([blockedId])
+}
+
+model TourMessageReport {
+  id              String                @id @default(uuid())
+  reporterId      String
+  messageId       String
+  tourId          String
+  reportedUserId  String
+  reason          CommunityReportReason
+  details         String?
+  status          CommunityReportStatus @default(OPEN)
+  resolutionNotes String?
+  reviewedById    String?
+  reviewedAt      DateTime?
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @updatedAt
+
+  Reporter     User        @relation("TourMessageReportReporter", fields: [reporterId], references: [id], onDelete: Restrict)
+  ReportedUser User        @relation("TourMessageReportSubject", fields: [reportedUserId], references: [id], onDelete: Restrict)
+  Reviewer     User?       @relation("TourMessageReportReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  Message      TourMessage @relation(fields: [messageId], references: [id], onDelete: Restrict)
+  Tour         Tour        @relation(fields: [tourId], references: [id], onDelete: Restrict)
+
+  @@unique([reporterId, messageId])
+  @@index([status, createdAt])
+  @@index([tourId])
+  @@index([reportedUserId])
+}
+
 model Tour {
-  id                   String         @id @default(uuid())
-  hostId               String
-  slug                 String         @unique
-  title                String
-  description          String
-  destination          String
-  city                 String?
-  state                String?
-  joinApprovalRequired Boolean        @default(false)
-  country              String?
-  latitude             Float?
-  longitude            Float?
-  duration             Int
-  tourStatus           TourStatus     @default(UPCOMING)
-  maxGroupSize         Int            @default(20)
-  totalSlots           Int            @default(20)
-  availableSlots       Int            @default(20)
-  pricePerPerson       Decimal        @db.Decimal(10, 2)
-  originalPrice        Decimal?       @db.Decimal(10, 2)
-  difficulty           TourDifficulty @default(MODERATE)
-  category             String?
-  tags                 String[]
-  images               String[]
-  highlights           String[]
-  chatRoom             TourChatRoom?
-  included             String[]
-  womenOnly            Boolean        @default(false)
+  id                      String         @id @default(uuid())
+  hostId                  String
+  slug                    String         @unique
+  title                   String
+  description             String
+  destination             String
+  city                    String?
+  state                   String?
+  joinApprovalRequired    Boolean        @default(false)
+  country                 String?
+  latitude                Float?
+  longitude               Float?
+  duration                Int
+  tourStatus              TourStatus     @default(UPCOMING)
+  maxGroupSize            Int            @default(20)
+  totalSlots              Int            @default(20)
+  availableSlots          Int            @default(20)
+  pricePerPerson          Decimal        @db.Decimal(10, 2)
+  originalPrice           Decimal?       @db.Decimal(10, 2)
+  difficulty              TourDifficulty @default(MODERATE)
+  riskLevel               TourRiskLevel  @default(LOW)
+  riskDisclosure          String?
+  meetingPoint            String?
+  eligibilityRequirements String[]       @default([])
+  requiredEquipment       String[]       @default([])
+  emergencyPlan           String?
+  minimumAge              Int            @default(18)
+  requiresCaretaker       Boolean        @default(false)
+  category                String?
+  tags                    String[]
+  images                  String[]
+  highlights              String[]
+  chatRoom                TourChatRoom?
+  included                String[]
+  womenOnly               Boolean        @default(false)
 
   safeForSoloWomen Boolean @default(false)
 
-  verifiedTravelersOnly Boolean            @default(false)
+  verifiedTravelersOnly Boolean             @default(false)
   excluded              String[]
   languages             String[]
   cancellationPolicy    String?
-  status                ListingStatus      @default(PENDING_REVIEW)
-  isActive              Boolean            @default(true)
-  isApproved            Boolean            @default(false)
-  averageRating         Float              @default(0)
-  totalReviews          Int                @default(0)
-  totalBookings         Int                @default(0)
+  status                ListingStatus       @default(PENDING_REVIEW)
+  isActive              Boolean             @default(true)
+  isApproved            Boolean             @default(false)
+  averageRating         Float               @default(0)
+  totalReviews          Int                 @default(0)
+  totalBookings         Int                 @default(0)
   // Moderation fields
   submittedForReviewAt  DateTime?
   approvedAt            DateTime?
@@ -901,25 +1136,28 @@ model Tour {
   rejectionReason       String?
   moderationNotes       String?
   lastReviewedStatus    ListingStatus?
-  createdAt             DateTime           @default(now())
-  updatedAt             DateTime           @updatedAt
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
   Booking               Booking[]
   Post                  Post[]
   startDate             DateTime
   endDate               DateTime
   registrationDeadline  DateTime?
   Review                Review[]
-  Host                  Host               @relation(fields: [hostId], references: [id], onDelete: Cascade)
-  ReviewedBy            User?              @relation("TourReviewer", fields: [reviewedById], references: [id])
+  Host                  Host                @relation(fields: [hostId], references: [id], onDelete: Cascade)
+  ReviewedBy            User?               @relation("TourReviewer", fields: [reviewedById], references: [id])
   TourItineraryDay      TourItineraryDay[]
   TourParticipant       TourParticipant[]
   TravelerReport        TravelerReport[]
+  TourMessageReport     TourMessageReport[]
   TourWaitlist          TourWaitlist[]
   WishlistItem          WishlistItem[]
+  Incident              Incident[]
 
   @@index([city])
   @@index([hostId])
   @@index([status, isActive, isApproved])
+  @@index([riskLevel, status])
   @@index([reviewedById])
   @@index([deletedAt])
 }
@@ -951,75 +1189,89 @@ model TourItineraryDay {
 }
 
 model User {
-  id                 String                @id @default(uuid())
-  name               String
-  email              String                @unique
-  password           String?
-  phone              String?               @unique
-  role               Role                  @default(USER)
-  status             AccountStatus         @default(ACTIVE)
-  isEmailVerified    Boolean               @default(false)
-  emailVerifiedAt    DateTime?
-  isPhoneVerified    Boolean               @default(false)
-  phoneVerifiedAt    DateTime?
-  failedLoginAttempts Int                  @default(0)
-  lockedUntil        DateTime?
-  verificationToken  String?
-  verificationExpiry DateTime?
-  resetToken         String?
-  resetTokenExpiry   DateTime?
-  provider           String                @default("credentials")
-  providerId         String?
-  lastLoginAt        DateTime?
-  createdAt          DateTime              @default(now())
-  updatedAt          DateTime              @updatedAt
+  id                     String                 @id @default(uuid())
+  name                   String
+  email                  String                 @unique
+  password               String?
+  phone                  String?                @unique
+  role                   Role                   @default(USER)
+  status                 AccountStatus          @default(ACTIVE)
+  isEmailVerified        Boolean                @default(false)
+  emailVerifiedAt        DateTime?
+  isPhoneVerified        Boolean                @default(false)
+  phoneVerifiedAt        DateTime?
+  failedLoginAttempts    Int                    @default(0)
+  lockedUntil            DateTime?
+  verificationToken      String?
+  verificationExpiry     DateTime?
+  resetToken             String?
+  resetTokenExpiry       DateTime?
+  provider               String                 @default("credentials")
+  providerId             String?
+  lastLoginAt            DateTime?
+  sessionInvalidatedAt   DateTime?
+  createdAt              DateTime               @default(now())
+  updatedAt              DateTime               @updatedAt
   // Moderation fields
-  isActive           Boolean               @default(true)
-  isBanned           Boolean               @default(false)
-  moderationReason   String?
-  reviewedAt         DateTime?
-  reviewedById       String?
-  bannedAt           DateTime?
-  suspendedAt        DateTime?
-  deletedAt          DateTime?
+  isActive               Boolean                @default(true)
+  isBanned               Boolean                @default(false)
+  moderationReason       String?
+  reviewedAt             DateTime?
+  reviewedById           String?
+  bannedAt               DateTime?
+  suspendedAt            DateTime?
+  deletedAt              DateTime?
   // Relations
-  ActivityBooking    ActivityBooking[]
-  AdminProfile       AdminProfile?
-  AuditLog           AuditLog[]
-  Booking            Booking[]
-  TourParticipant    TourParticipant[]
-  SentMessages       TourMessage[]
-  SeenTourMessages   TourMessageSeen[]
-  TravelPreferences  UserTravelPreference?
-  ReportedTravelers  TravelerReport[]      @relation("Reporter")
-  ReceivedReports    TravelerReport[]      @relation("ReportedUser")
-  CouponRedemption   CouponRedemption[]
-  Host               Host?
-  Notification       Notification[]
-  Payment            Payment[]
-  Payout             Payout[]
-  Post               Post[]
-  PostComment        PostComment[]
-  PostLike           PostLike[]
-  RefreshToken       RefreshToken[]
-  Session            Session[]
-  PasswordResetToken PasswordResetToken[]
-  UserDevice         UserDevice[]
-  EmailChangeRequest EmailChangeRequest[]
-  SecurityEvent      SecurityEvent[]
-  RentalBooking      RentalBooking[]
-  Review             Review[]
-  UserProfile        UserProfile?
-  WishlistItem       WishlistItem[]
-  TourWaitlist       TourWaitlist[]
-  ReviewedUsers      User[]                @relation("UserReviewer")
-  ReviewedByUser     User?                 @relation("UserReviewer", fields: [reviewedById], references: [id])
-  ReviewedHosts      Host[]                @relation("HostReviewer")
-  ReviewedTours      Tour[]                @relation("TourReviewer")
-  ReviewedRentals    Rental[]              @relation("RentalReviewer")
-  ReviewedActivities Activity[]            @relation("ActivityReviewer")
-  ReviewedKyc        KycApplication[]      @relation("KycReviewer")
-  ModerationLogs     ModerationLog[]       @relation("ModerationLogAdmin")
+  ActivityBooking        ActivityBooking[]
+  AdminProfile           AdminProfile?
+  AuditLog               AuditLog[]
+  Booking                Booking[]
+  TourParticipant        TourParticipant[]
+  SentMessages           TourMessage[]
+  SeenTourMessages       TourMessageSeen[]
+  TravelPreferences      UserTravelPreference?
+  ReportedTravelers      TravelerReport[]       @relation("Reporter")
+  ReceivedReports        TravelerReport[]       @relation("ReportedUser")
+  BlocksCreated          UserBlock[]            @relation("UserBlocksCreated")
+  BlocksReceived         UserBlock[]            @relation("UserBlocksReceived")
+  MessageReportsMade     TourMessageReport[]    @relation("TourMessageReportReporter")
+  MessageReportsAbout    TourMessageReport[]    @relation("TourMessageReportSubject")
+  MessageReportsReviewed TourMessageReport[]    @relation("TourMessageReportReviewer")
+  CouponRedemption       CouponRedemption[]
+  Host                   Host?
+  Notification           Notification[]
+  NotificationDelivery   NotificationDelivery[]
+  Payment                Payment[]
+  Payout                 Payout[]
+  Post                   Post[]
+  PostComment            PostComment[]
+  PostLike               PostLike[]
+  RefreshToken           RefreshToken[]
+  Session                Session[]
+  PasswordResetToken     PasswordResetToken[]
+  UserDevice             UserDevice[]
+  EmailChangeRequest     EmailChangeRequest[]
+  SecurityEvent          SecurityEvent[]
+  RentalBooking          RentalBooking[]
+  Review                 Review[]
+  UserProfile            UserProfile?
+  WishlistItem           WishlistItem[]
+  TourWaitlist           TourWaitlist[]
+  ReviewedUsers          User[]                 @relation("UserReviewer")
+  ReviewedByUser         User?                  @relation("UserReviewer", fields: [reviewedById], references: [id])
+  ReviewedHosts          Host[]                 @relation("HostReviewer")
+  ReviewedTours          Tour[]                 @relation("TourReviewer")
+  ReviewedRentals        Rental[]               @relation("RentalReviewer")
+  ReviewedActivities     Activity[]             @relation("ActivityReviewer")
+  ReviewedKyc            KycApplication[]       @relation("KycReviewer")
+  ModerationLogs         ModerationLog[]        @relation("ModerationLogAdmin")
+  ReportedIncidents      Incident[]             @relation("IncidentReporter")
+  OwnedIncidents         Incident[]             @relation("IncidentOwner")
+  IncidentEvents         IncidentEvent[]        @relation("IncidentActor")
+  OrganizationMember     OrganizationMember[]
+  SsoAuditLog            SsoAuditLog[]
+  PolicyConsents         PolicyConsent[]
+  PublishedPolicies      Policy[]               @relation("PolicyPublisher")
 
   @@index([email])
   @@index([role])
@@ -1039,22 +1291,22 @@ enum Gender {
 }
 
 model UserProfile {
-  id           String    @id @default(uuid())
-  userId       String    @unique
-  avatarUrl    String?
-  bio          String?
-  dateOfBirth  DateTime?
-  gender       Gender?
-  address      String?
-  city         String?
-  state        String?
-  country      String?
-  postalCode   String?
-  themeSettings        Json? @map("theme")
-  notificationSettings Json? @map("notification")
-  uiSettings           Json? @map("ui")
+  id                   String    @id @default(uuid())
+  userId               String    @unique
+  avatarUrl            String?
+  bio                  String?
+  dateOfBirth          DateTime?
+  gender               Gender?
+  address              String?
+  city                 String?
+  state                String?
+  country              String?
+  postalCode           String?
+  themeSettings        Json?     @map("theme")
+  notificationSettings Json?     @map("notification")
+  uiSettings           Json?     @map("ui")
   preferences          Json?
-  showGender   Boolean   @default(true)
+  showGender           Boolean   @default(true)
 
   showCity Boolean @default(true)
 
@@ -1096,6 +1348,7 @@ model TourJoinRequest {
 
   createdAt DateTime @default(now())
 }
+
 model TourMessageSeen {
   id String @id @default(uuid())
 
@@ -1173,8 +1426,9 @@ model TourMessage {
 
   SeenBy TourMessageSeen[]
 
-  @@index([roomId, createdAt])
+  Reports TourMessageReport[]
 
+  @@index([roomId, createdAt])
   @@index([senderId])
 }
 
@@ -1253,31 +1507,34 @@ model TourWaitlist {
 }
 
 model TourBooking {
-  id              String    @id @default(uuid())
-  bookingCode     String    @unique
-  userId          String
-  hostId          String
-  tourId          String
-  batchId         String?
-  legacyBookingId String?   @unique
-  status          String    @default("PENDING")
-  paymentStatus   String    @default("PENDING")
-  travelersCount  Int       @default(1)
-  confirmedCount  Int       @default(0)
-  waitlistedCount Int       @default(0)
-  unitPrice       Decimal   @db.Decimal(10, 2)
-  subtotal        Decimal   @db.Decimal(10, 2)
-  taxes           Decimal   @default(0) @db.Decimal(10, 2)
-  discount        Decimal   @default(0) @db.Decimal(10, 2)
-  totalAmount     Decimal   @db.Decimal(10, 2)
-  currency        String    @default("INR")
-  expiresAt       DateTime?
-  confirmedAt     DateTime?
-  cancelledAt     DateTime?
-  deletedAt       DateTime?
-  metadata        Json?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  id                     String    @id @default(uuid())
+  bookingCode            String    @unique
+  userId                 String
+  hostId                 String
+  tourId                 String
+  batchId                String?
+  legacyBookingId        String?   @unique
+  idempotencyKey         String?   @unique
+  status                 String    @default("PENDING")
+  paymentStatus          String    @default("PENDING")
+  travelersCount         Int       @default(1)
+  confirmedCount         Int       @default(0)
+  waitlistedCount        Int       @default(0)
+  unitPrice              Decimal   @db.Decimal(10, 2)
+  subtotal               Decimal   @db.Decimal(10, 2)
+  taxes                  Decimal   @default(0) @db.Decimal(10, 2)
+  discount               Decimal   @default(0) @db.Decimal(10, 2)
+  totalAmount            Decimal   @db.Decimal(10, 2)
+  currency               String    @default("INR")
+  expiresAt              DateTime?
+  confirmedAt            DateTime?
+  cancelledAt            DateTime?
+  deletedAt              DateTime?
+  metadata               Json?
+  riskAcknowledgedAt     DateTime?
+  riskDisclosureSnapshot Json?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
 
   @@index([userId, createdAt])
   @@index([tourId, status])
@@ -1394,6 +1651,85 @@ enum AuditSeverity {
   CRITICAL
 }
 
+enum IncidentCategory {
+  SAFETY
+  HARASSMENT
+  MEDICAL
+  TRANSPORT
+  HOST_CONDUCT
+  TRAVELER_CONDUCT
+  LOST_PERSON
+  PROPERTY
+  OTHER
+}
+
+enum IncidentSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum IncidentStatus {
+  OPEN
+  TRIAGED
+  IN_PROGRESS
+  RESOLVED
+  CLOSED
+}
+
+model Incident {
+  id                String           @id @default(uuid())
+  referenceCode     String           @unique
+  reporterId        String
+  ownerId           String?
+  bookingId         String
+  tourId            String
+  hostId            String
+  category          IncidentCategory
+  severity          IncidentSeverity @default(MEDIUM)
+  status            IncidentStatus   @default(OPEN)
+  title             String
+  description       String
+  immediateDanger   Boolean          @default(false)
+  resolutionSummary String?
+  triagedAt         DateTime?
+  resolvedAt        DateTime?
+  closedAt          DateTime?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+  Reporter          User             @relation("IncidentReporter", fields: [reporterId], references: [id], onDelete: Restrict)
+  Owner             User?            @relation("IncidentOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  Booking           Booking          @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+  Tour              Tour             @relation(fields: [tourId], references: [id], onDelete: Restrict)
+  Host              Host             @relation(fields: [hostId], references: [id], onDelete: Restrict)
+  IncidentEvent     IncidentEvent[]
+
+  @@index([reporterId, createdAt])
+  @@index([ownerId, status])
+  @@index([status, severity, createdAt])
+  @@index([tourId])
+  @@index([hostId])
+  @@index([bookingId])
+}
+
+model IncidentEvent {
+  id         String          @id @default(uuid())
+  incidentId String
+  actorId    String
+  action     String
+  note       String?
+  oldStatus  IncidentStatus?
+  newStatus  IncidentStatus?
+  metadata   Json?
+  createdAt  DateTime        @default(now())
+  Incident   Incident        @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  Actor      User            @relation("IncidentActor", fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([incidentId, createdAt])
+  @@index([actorId])
+}
+
 enum ModerationAction {
   APPROVED
   REJECTED
@@ -1457,6 +1793,26 @@ enum BookingStatus {
   COMPLETED
   NO_SHOW
   REFUND_PENDING
+}
+
+enum RentalInspectionStage {
+  PICKUP
+  RETURN
+}
+
+enum RentalInspectionStatus {
+  DRAFT
+  SUBMITTED
+  ACKNOWLEDGED
+  DISPUTED
+  RESOLVED
+}
+
+enum RentalDisputeResolution {
+  HOST_EVIDENCE_ACCEPTED
+  TRAVELER_CLAIM_ACCEPTED
+  MUTUAL_SETTLEMENT
+  NO_FINANCIAL_ACTION
 }
 
 enum BusinessType {
@@ -1526,6 +1882,18 @@ enum NotificationType {
   SYSTEM
 }
 
+enum NotificationDeliveryChannel {
+  EMAIL
+}
+
+enum NotificationDeliveryStatus {
+  PENDING
+  PROCESSING
+  DELIVERED
+  FAILED
+  DEAD_LETTER
+}
+
 enum PaymentStatus {
   PENDING
   PROCESSING
@@ -1558,6 +1926,13 @@ enum TourDifficulty {
   MODERATE
   HARD
   EXPERT
+}
+
+enum TourRiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+  VERY_HIGH
 }
 
 enum TransmissionType {
@@ -1629,3 +2004,156 @@ enum TourParticipantStatus {
   CANCELLED
   COMPLETED
 }
+
+// ==========================================
+// Enterprise Single Sign-On (SSO) Module
+// ==========================================
+
+enum SsoProtocol {
+  OIDC
+  SAML2
+}
+
+enum SsoIdpProvider {
+  ENTRA_ID
+  OKTA
+  GOOGLE_WORKSPACE
+  ONELOGIN
+  GENERIC_SAML
+  GENERIC_OIDC
+}
+
+model Organization {
+  id          String                 @id @default(uuid())
+  slug        String                 @unique
+  name        String
+  domain      String                 @unique
+  isActive    Boolean                @default(true)
+  ssoConfig   SsoConfiguration?
+  members     OrganizationMember[]
+  auditLogs   SsoAuditLog[]
+  createdAt   DateTime               @default(now())
+  updatedAt   DateTime               @updatedAt
+
+  @@index([domain, isActive])
+}
+
+model SsoConfiguration {
+  id                       String         @id @default(uuid())
+  organizationId           String         @unique
+  organization             Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  protocol                 SsoProtocol    @default(OIDC)
+  provider                 SsoIdpProvider @default(ENTRA_ID)
+  
+  // OIDC Configuration
+  issuerUrl                String?
+  clientId                 String?
+  clientSecretEncrypted    String?
+  
+  // SAML 2.0 Configuration
+  entryPoint               String?
+  issuer                   String?
+  cert                     String?        @db.Text
+  logoutUrl                String?
+  
+  // Policies & Provisioning
+  jitEnabled               Boolean        @default(true)
+  defaultRole              Role           @default(USER)
+  inactivityTimeoutMinutes Int            @default(30)
+  enforceMfaAtIdp          Boolean        @default(true)
+  allowPasswordFallback    Boolean        @default(false)
+  
+  createdAt                DateTime       @default(now())
+  updatedAt                DateTime       @updatedAt
+
+  @@index([organizationId])
+}
+
+model OrganizationMember {
+  id             String       @id @default(uuid())
+  organizationId String
+  userId         String
+  employeeId     String?
+  department     String?
+  role           String       @default("EMPLOYEE")
+  isCurrent      Boolean      @default(true)
+  joinedAt       DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, userId])
+  @@unique([organizationId, employeeId])
+  @@index([organizationId, isCurrent])
+  @@index([userId])
+}
+
+model SsoAuditLog {
+  id             String       @id @default(uuid())
+  organizationId String
+  userId         String?
+  email          String
+  eventType      String
+  protocol       SsoProtocol
+  idpEntityId    String?
+  ipAddress      String?
+  userAgent      String?
+  failureReason  String?
+  metadata       Json?
+  timestamp      DateTime     @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user           User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, timestamp])
+  @@index([email, eventType])
+  @@index([userId])
+}
+
+enum PolicyType {
+  TERMS_OF_SERVICE
+  PRIVACY_POLICY
+  HOST_SAFETY_AGREEMENT
+  TRAVELER_SAFETY_POLICY
+  CANCELLATION_POLICY
+}
+
+model Policy {
+  id            String          @id @default(uuid())
+  type          PolicyType
+  title         String
+  version       String
+  summary       String?         @db.Text
+  content       String          @db.Text
+  isActive      Boolean         @default(true)
+  effectiveDate DateTime        @default(now())
+  publishedById String?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  PublishedBy   User?           @relation("PolicyPublisher", fields: [publishedById], references: [id])
+  Consents      PolicyConsent[]
+
+  @@unique([type, version])
+  @@index([type, isActive])
+  @@index([publishedById])
+}
+
+model PolicyConsent {
+  id            String     @id @default(uuid())
+  userId        String
+  policyId      String
+  policyType    PolicyType
+  policyVersion String
+  ipAddress     String?
+  userAgent     String?
+  context       String     @default("SIGNUP")
+  consentedAt   DateTime   @default(now())
+  User          User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  Policy        Policy     @relation(fields: [policyId], references: [id], onDelete: Cascade)
+
+  @@index([userId, policyType])
+  @@index([policyId])
+  @@index([consentedAt])
+}
+

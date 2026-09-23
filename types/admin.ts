@@ -1,1 +1,1 @@
-export type AdminBooking = any
+export type AdminBooking = Record<string, unknown>

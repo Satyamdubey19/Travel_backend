@@ -7,7 +7,10 @@
     "build": "next build",
     "start": "next start -p 4000",
     "lint": "eslint",
+    "test": "tsx --test tests/**/*.test.ts",
     "seed": "tsx prisma/seed.ts",
+    "auth:schema-audit": "tsx scripts/auth-schema-audit.ts",
+    "env:check": "tsx scripts/environment-preflight.ts",
     "socket": "tsx lib/socket-server.ts"
   },
   "dependencies": {
@@ -52,9 +55,8 @@
     "react-redux": "^9.2.0",
     "react-use": "^17.6.0",
     "react-window": "^2.2.7",
-    "resend": "^6.1.3",
     "shadcn": "^4.3.0",
-    "sharp": "^0.34.5",
+    "sharp": "0.35.4",
     "socket.io": "^4.8.3",
     "socket.io-client": "^4.8.3",
     "sonner": "^2.0.7",

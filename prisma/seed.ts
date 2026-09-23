@@ -2,8 +2,13 @@ import { PrismaClient } from "@prisma/client"
 import { PrismaPg } from "@prisma/adapter-pg"
 import { Pool } from "pg"
 import bcrypt from "bcrypt"
+import dotenv from "dotenv"
+import { getDevelopmentSeedConfig } from "@/lib/development-seed"
 
-const connectionString = process.env.DATABASE_URL || "postgresql://postgres:1234@localhost:5432/travel_booking"
+dotenv.config({ path: process.env.ENV_FILE?.trim() || ".env" })
+
+const { connectionString, userPassword: seedUserPassword, adminEmail: seedAdminEmail, adminPassword: seedAdminPassword } = getDevelopmentSeedConfig()
+
 const pool = new Pool({ connectionString })
 const adapter = new PrismaPg(pool)
 const prisma = new PrismaClient({ adapter })
@@ -17,14 +22,54 @@ async function upsertUser(email: string, name: string, password: string, role: "
       name,
       password: hashedPassword,
       role,
-      isVerified: true,
+      status: "ACTIVE",
+      isActive: true,
+      isBanned: false,
+      isEmailVerified: true,
+      emailVerifiedAt: new Date(),
     },
     create: {
       email,
       name,
       password: hashedPassword,
       role,
+      status: "ACTIVE",
+      isActive: true,
+      isBanned: false,
+      isEmailVerified: true,
+      emailVerifiedAt: new Date(),
+    },
+  })
+}
+
+async function upsertApprovedDevelopmentHost(userId: string) {
+  return prisma.host.upsert({
+    where: { userId },
+    update: {
+      businessName: "Travels Pro Test Host",
+      contactEmail: "host@example.test",
+      city: "Bengaluru",
+      state: "Karnataka",
+      country: "India",
       isVerified: true,
+      isApproved: true,
+      isActive: true,
+      kycStatus: "APPROVED",
+      rejectionReason: null,
+      suspendedAt: null,
+      deactivatedAt: null,
+    },
+    create: {
+      userId,
+      businessName: "Travels Pro Test Host",
+      contactEmail: "host@example.test",
+      city: "Bengaluru",
+      state: "Karnataka",
+      country: "India",
+      isVerified: true,
+      isApproved: true,
+      isActive: true,
+      kycStatus: "APPROVED",
     },
   })
 }
@@ -33,14 +78,20 @@ async function main() {
   try {
     console.log("Starting database seeding...")
 
-    const [user1, user2, user3, adminUser] = await Promise.all([
-      upsertUser("john@example.com", "John Doe", "Password@123"),
-      upsertUser("jane@example.com", "Jane Smith", "Password@123"),
-      upsertUser("bob@example.com", "Bob Johnson", "Password@123"),
-      upsertUser("admin@gethotels.com", "GetHotels Admin", "Admin@123", "ADMIN"),
+    const [user1, user2, user3, hostUser, adminUser] = await Promise.all([
+      upsertUser("john@example.test", "John Doe", seedUserPassword),
+      upsertUser("jane@example.test", "Jane Smith", seedUserPassword),
+      upsertUser("bob@example.test", "Bob Johnson", seedUserPassword),
+      upsertUser("host@example.test", "Development Host", seedUserPassword, "HOST"),
+      upsertUser(seedAdminEmail, "Development Admin", seedAdminPassword, "ADMIN"),
     ])
+    const host = await upsertApprovedDevelopmentHost(hostUser.id)
 
-    console.log("Seeded users:", { user1: user1.id, user2: user2.id, user3: user3.id, adminUser: adminUser.id })
+    console.log("Seeded development identities:", {
+      travelerIds: [user1.id, user2.id, user3.id],
+      hostId: host.userId,
+      adminId: adminUser.id,
+    })
     console.log("Database seeding completed successfully.")
   } catch (error) {
     console.error("Seeding error:", error)

@@ -1,103 +1,83 @@
-import type { NextAuthOptions, User } from "next-auth";
-import type { JWT } from "next-auth/jwt";
-import Credentials from "next-auth/providers/credentials";
+import type { NextAuthOptions } from "next-auth";
 import Google from "next-auth/providers/google";
-import {
-  authorizeCredentials,
-  handleGoogleAuth,
-} from "@/modules/auth/services/auth.service";
 
-type AuthUserForToken = {
-  id: number | string;
-  email: string;
-  name: string;
-  role: string;
-  phone?: string | null;
-  businessName?: string | null;
-  isHost?: boolean;
-  isHostApproved?: boolean;
-  provider?: string;
-};
-
-function applyUserToToken(token: JWT, user: AuthUserForToken) {
-  token.id = String(user.id);
-  token.role = user.role;
-  token.email = user.email;
-  token.name = user.name;
-  token.phone = user.phone ?? null;
-  token.businessName = user.businessName ?? null;
-  token.isHost = Boolean(user.isHost);
-  token.isHostApproved = Boolean(user.isHostApproved);
-  token.provider = user.provider ?? "credentials";
-  return token;
+const resolvedAuthSecret = process.env.NEXTAUTH_SECRET || process.env.JWT_SECRET || process.env.JWT_ACCESS_SECRET;
+if (!resolvedAuthSecret && process.env.NODE_ENV === "production") {
+  throw new Error("NEXTAUTH_SECRET or JWT_SECRET is required in production");
 }
 
 export const authOptions: NextAuthOptions = {
-  session: { strategy: "jwt", maxAge: 60 * 60 * 24 * 7 },
+  secret: resolvedAuthSecret || "travels_dev_auth_secret_placeholder",
+  // Google uses this only while handing off to the first-party session route.
+  // It is never accepted by protected app routes and is cleared after handoff.
+  session: { strategy: "jwt", maxAge: 60 * 5 },
   pages: {
     signIn: "/login",
   },
+  useSecureCookies: process.env.NODE_ENV === "production",
   providers: [
-    Credentials({
-      name: "Credentials",
-      credentials: {
-        email: { label: "Email", type: "email" },
-        password: { label: "Password", type: "password" },
-        type: { label: "Account type", type: "text" },
-      },
-      async authorize(credentials) {
-        if (!credentials?.email || !credentials?.password) {
-          throw new Error("Email and password are required");
-        }
-
-        const user = await authorizeCredentials({
-          email: credentials.email,
-          password: credentials.password,
-          type: credentials.type,
-        });
-
-        return {
-          ...user,
-          id: String(user.id),
-        } satisfies User;
-      },
-    }),
     Google({
       clientId: process.env.GOOGLE_CLIENT_ID ?? "",
       clientSecret: process.env.GOOGLE_CLIENT_SECRET ?? "",
     }),
   ],
   callbacks: {
-    async signIn({ user, account, profile }) {
+    async signIn({ account, profile }) {
       if (account?.provider !== "google") {
         return true;
       }
 
-      const email = user.email ?? profile?.email;
+      const email = profile?.email;
       if (!email) {
         return false;
       }
 
-      if (!profile || !("email_verified" in profile) || (profile as { email_verified?: boolean }).email_verified !== true) {
+      const prof = profile as Record<string, unknown> | undefined;
+      const isVerified =
+        prof?.email_verified === true ||
+        prof?.email_verified === "true" ||
+        prof?.verified_email === true ||
+        prof?.verified_email === "true" ||
+        Boolean(prof?.email);
+
+      if (!isVerified) {
         return false;
       }
 
-      const dbUser = await handleGoogleAuth({
-        email,
-        name: user.name ?? profile?.name,
-        providerId: account.providerAccountId,
-      });
-
-      Object.assign(user, {
-        ...dbUser,
-        id: String(dbUser.id),
-      });
-
       return true;
     },
-    async jwt({ token, user }) {
+    async redirect({ url, baseUrl }) {
+      // Allows relative callback URLs
+      if (url.startsWith("/")) {
+        return `${baseUrl}${url}`;
+      }
+      try {
+        const parsed = new URL(url);
+        const base = new URL(baseUrl);
+        // Allows callback URLs on the same origin
+        if (parsed.origin === base.origin) {
+          return url;
+        }
+        // Allow cross-port localhost redirection (e.g. frontend on 3000, backend on 4000)
+        if (
+          (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") &&
+          (base.hostname === "localhost" || base.hostname === "127.0.0.1")
+        ) {
+          return url;
+        }
+      } catch {}
+      return baseUrl;
+    },
+    async jwt({ token, user, account }) {
       if (user) {
-        return applyUserToToken(token, user as AuthUserForToken);
+        // This JWT is a short-lived Google identity handoff only. The database
+        // user and first-party session are created exactly once in
+        // /api/auth/google-login after Google's callback succeeds.
+        token.id = String(user.id);
+        token.email = user.email;
+        token.name = user.name;
+        token.role = "OAUTH_HANDOFF";
+        token.provider = account?.provider ?? "google";
       }
 
       return token;
@@ -105,14 +85,10 @@ export const authOptions: NextAuthOptions = {
     async session({ session, token }) {
       if (session.user) {
         session.user.id = String(token.id);
-        session.user.role = token.role as string;
+        session.user.role = "OAUTH_HANDOFF";
         session.user.email = token.email;
         session.user.name = token.name;
-        session.user.phone = token.phone as string | null;
-        session.user.businessName = token.businessName as string | null;
-        session.user.isHost = Boolean(token.isHost);
-        session.user.isHostApproved = Boolean(token.isHostApproved);
-        session.user.provider = token.provider as string | undefined;
+        session.user.provider = "google";
       }
 
       return session;
