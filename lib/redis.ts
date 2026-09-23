@@ -15,12 +15,12 @@ export function getRedisClient() {
   try {
     parsed = new URL(redisUrl)
   } catch {
-    if (process.env.NODE_ENV === "production") throw new Error("REDIS_URL must be a valid redis connection string")
+    console.error("[Redis] Invalid REDIS_URL format. Falling back to primary storage.")
     return null
   }
 
   if ((parsed.protocol !== "redis:" && parsed.protocol !== "rediss:") || !parsed.hostname) {
-    if (process.env.NODE_ENV === "production") throw new Error("REDIS_URL must use redis:// or rediss://")
+    console.error(`[Redis] REDIS_URL must use redis:// or rediss:// (received ${parsed.protocol}). Falling back to primary storage.`)
     return null
   }
 
