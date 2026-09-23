@@ -8,16 +8,26 @@ import { createAuthSessionForUser, DeviceLimitReachedError, handleGoogleAuth, lo
 import { authLoginRecoveryPath, safeAuthCallbackPath } from "@/modules/auth/services/auth-redirect"
 
 function getAppUrl(request: NextRequest) {
+  const configuredFrontend = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_APP_URL
+  if (configuredFrontend) {
+    try {
+      return new URL(configuredFrontend).origin
+    } catch {}
+  }
   const configured = process.env.NEXTAUTH_URL
-  if (configured) {
+  if (configured && !configured.includes("onrender.com")) {
     try {
       return new URL(configured).origin
-    } catch {
-      // Fall back to the current application origin so misconfiguration cannot
-      // turn an error-recovery redirect into another framework exception.
-    }
+    } catch {}
   }
-  return request.nextUrl.origin
+  // Check forwarded host from Vercel proxy
+  const forwardedHost = request.headers.get("x-forwarded-host")
+  const forwardedProto = request.headers.get("x-forwarded-proto") || "https"
+  if (forwardedHost && !forwardedHost.includes("onrender.com")) {
+    return `${forwardedProto}://${forwardedHost}`
+  }
+
+  return "https://rootly-mu.vercel.app"
 }
 
 function parseBrowser(userAgent?: string) {

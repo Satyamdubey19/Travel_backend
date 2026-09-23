@@ -47,15 +47,23 @@ export const authOptions: NextAuthOptions = {
       return true;
     },
     async redirect({ url, baseUrl }) {
-      // Allows relative callback URLs
+      const frontendOrigin =
+        process.env.FRONTEND_URL ||
+        process.env.NEXT_PUBLIC_APP_URL ||
+        "https://rootly-mu.vercel.app";
+
+      // Allows relative callback URLs - attach to frontend or baseUrl
       if (url.startsWith("/")) {
-        return `${baseUrl}${url}`;
+        const targetBase = baseUrl.includes("onrender.com") ? frontendOrigin : baseUrl;
+        return `${targetBase}${url}`;
       }
       try {
         const parsed = new URL(url);
         const base = new URL(baseUrl);
-        // Allows callback URLs on the same origin
-        if (parsed.origin === base.origin) {
+        const frontend = new URL(frontendOrigin);
+
+        // Allows callback URLs on the same origin or frontend origin
+        if (parsed.origin === base.origin || parsed.origin === frontend.origin) {
           return url;
         }
         // Allow cross-port localhost redirection (e.g. frontend on 3000, backend on 4000)
@@ -66,7 +74,8 @@ export const authOptions: NextAuthOptions = {
           return url;
         }
       } catch {}
-      return baseUrl;
+
+      return baseUrl.includes("onrender.com") ? frontendOrigin : baseUrl;
     },
     async jwt({ token, user, account }) {
       if (user) {
