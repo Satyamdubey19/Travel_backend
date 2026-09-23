@@ -7,15 +7,31 @@ dotenv.config({ path: ".env.local" })
 dotenv.config({ path: ".env" })
 
 const httpServer = createServer()
-const port = Number(process.env.SOCKET_PORT ?? 3001)
+const port = Number(process.env.PORT ?? process.env.SOCKET_PORT ?? 3001)
+
+const rawOrigins = [
+  process.env.CORS_ORIGIN,
+  process.env.FRONTEND_URL,
+  process.env.NEXT_PUBLIC_APP_URL,
+  process.env.NEXTAUTH_URL,
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+]
+
+const allowedOrigins = rawOrigins
+  .filter(Boolean)
+  .flatMap((value) => String(value).split(","))
+  .map((value) => {
+    try {
+      return new URL(value.trim()).origin
+    } catch {
+      return value.trim()
+    }
+  })
 
 const io = new Server(httpServer, {
   cors: {
-    origin: [
-      process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000",
-      process.env.NEXTAUTH_URL ?? "http://localhost:3000",
-      "http://127.0.0.1:3000",
-    ],
+    origin: allowedOrigins,
     credentials: true,
     methods: ["GET", "POST"],
   },

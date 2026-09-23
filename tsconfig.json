@@ -40,6 +40,8 @@
   "exclude": [
     "node_modules",
     "prisma/seed.ts",
-    ".next/dev"
+    ".next/dev",
+    "tests",
+    "scratch"
   ]
 }
